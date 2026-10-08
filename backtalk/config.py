@@ -66,12 +66,23 @@ DEFAULTS = {
     # "bypassPermissions" is AUTO-APPROVE: the agent acts without
     # asking, exactly like a terminal session with approvals off.
     # (Not to be confused with hands-free LISTENING, which is about
-    # the microphone: see mic_mode below.) Never hand-edit this file
-    # to switch: tell your agent to change it (takes effect next
-    # launch), or say "stop asking for permission" (then "confirm")
-    # or "start asking again" inside a voice session for an immediate
-    # flip that also saves. The legacy value "default" now
-    # behaves as "ask" (a headless voice session could never render
+    # the microphone: see mic_mode below.)
+    # "confirm_risk" is the middle ground: routine, reversible calls
+    # (reading anything; writing or editing a file inside your own
+    # agent_dir/extra_dirs; a web fetch or search) go through silently,
+    # same as bypass. Anything else -- and every Bash command except a
+    # short allowlist of known-safe, read-only ones (ls, cat, grep,
+    # git status/log/diff, that kind of thing) -- still gets the full
+    # spoken ask below. Deliberately allowlist-based, not denylist-based,
+    # for Bash: a list of known-dangerous commands is easy to miss a
+    # case for, a list of known-safe ones means anything unrecognized
+    # defaults to asking, the safe direction to be wrong in. See
+    # `_is_reversible()` in main.py for the actual classifier.
+    # Never hand-edit this file to switch: tell your agent to change it
+    # (takes effect next launch), or say "stop asking for permission"
+    # (then "confirm") or "start asking again" inside a voice session
+    # for an immediate flip that also saves. The legacy value "default"
+    # now behaves as "ask" (a headless voice session could never render
     # the terminal prompt it promised).
     "permission_mode": "ask",
     # Which of your agent's skills the voice session can SEE. null keeps the
@@ -86,9 +97,24 @@ DEFAULTS = {
     # Extra folders the agent may access beyond agent_dir (e.g. your
     # notes vault). Absolute paths or ~ paths.
     "extra_dirs": [],
-    # Hold-to-talk key. Named keys ("home", "f13", "right_alt", ...)
-    # or a single character.
-    "ptt_key": "home",
+    # Folders the agent may NEVER read, list, or touch via any tool —
+    # the opposite of extra_dirs. Enforced by a PreToolUse hook (see
+    # path_guard.py), which the SDK fires on every tool call regardless
+    # of permission_mode, including "bypassPermissions" — unlike the
+    # spoken gate in main.py, which bypassPermissions skips entirely.
+    # That's what makes this a real hard boundary rather than a setting
+    # someone could switch past: for a path listed here, there is no
+    # permission mode that lets a tool call through. Meant for things
+    # like a locally-synced SharePoint/OneDrive folder holding data a
+    # compliance policy says must never reach an external AI tool.
+    # Absolute paths or ~ paths; matches on substring against the
+    # expanded path, so a parent folder blocks everything under it.
+    "blocked_paths": [],
+    # Hold-to-talk key. Named keys ("left_ctrl", "f13", "right_alt", ...)
+    # or a single character. left_ctrl is the shipped default: it exists
+    # on every keyboard (unlike Home, which laptops often lack), sits at
+    # a spot findable by feel, and does nothing on its own in any app.
+    "ptt_key": "left_ctrl",
     # The microphone mode. "ptt" (push to talk, the default and the
     # recommendation): the mic is closed except while the key is held,
     # so room audio and your own speakers can never trigger the agent.
@@ -263,6 +289,7 @@ def load() -> dict:
               f"using defaults", flush=True)
     cfg["agent_dir"] = _expand(cfg["agent_dir"])
     cfg["extra_dirs"] = [_expand(d) for d in cfg.get("extra_dirs", [])]
+    cfg["blocked_paths"] = [_expand(d) for d in cfg.get("blocked_paths", [])]
     cfg["signals_dir"] = _expand(cfg.get("signals_dir", "")) or str(REPO)
     cfg["barehands_state_dir"] = _expand(cfg.get("barehands_state_dir", ""))
     thinking = _expand(cfg.get("thinking_sound", ""))
@@ -274,7 +301,7 @@ def load() -> dict:
     cfg["quit_phrases"] = tuple(cfg.get("quit_phrases") or (
         f"goodbye {low}", f"good bye {low}", "end voice mode",
         f"hang up {low}", "hang up"))
-    key_label = "the " + str(cfg.get("ptt_key", "home")).replace("_", " ") \
+    key_label = "the " + str(cfg.get("ptt_key", "left_ctrl")).replace("_", " ") \
                 + " key"
     # In hands-free there is no key to hold, so a separate line can be set.
     if str(cfg.get("mic_mode", "ptt")) == "open" and cfg.get("greeting_open_mic"):

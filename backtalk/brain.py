@@ -34,7 +34,7 @@ import re
 import warnings
 from datetime import datetime
 
-from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, HookMatcher
 
 try:
     from claude_agent_sdk import CanUseToolShadowedWarning
@@ -43,9 +43,83 @@ except ImportError:                       # older SDKs: nothing to silence
 
 from backtalk import signals
 from backtalk.config import CFG, DISCIPLINE
+from backtalk.path_guard import guard_blocked_paths
 from backtalk.vlog import log
 
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s")
+
+# Plain-English labels for a face to show while a tool runs and the
+# brain has gone quiet. Unlisted tools (custom MCP tools, future
+# built-ins) still get a readable fallback rather than showing nothing.
+_TOOL_LABELS = {
+    "Bash": "Running a command",
+    "Read": "Reading a file",
+    "Write": "Writing a file",
+    "Edit": "Editing a file",
+    "NotebookEdit": "Editing a notebook",
+    "Glob": "Searching for files",
+    "Grep": "Searching for text",
+    "WebSearch": "Searching the web",
+    "WebFetch": "Reading a web page",
+    "Agent": "Delegating to a subagent",
+    "Task": "Delegating to a subagent",
+    "TodoWrite": "Updating the task list",
+    "SlashCommand": "Running a command",
+}
+
+
+def _task_label(tool_name: str) -> str:
+    return _TOOL_LABELS.get(tool_name, f"Working: {tool_name}" if tool_name
+                             else "Working")
+
+
+async def _task_start_hook(input_data, tool_use_id, context):
+    """PreToolUse hook: mark this call as running the moment the SDK
+    actually dispatches it for execution, keyed by the SDK's own
+    tool_use_id rather than guessed from the raw content-block stream.
+    Parallel tool calls each get their own id, so they show up as
+    independent entries instead of racing to overwrite one slot."""
+    signals.start_task(tool_use_id, _task_label(input_data.get("tool_name", "")))
+    return {}
+
+
+async def _task_end_hook(input_data, tool_use_id, context):
+    """PostToolUse / PostToolUseFailure hook: that call is done (or
+    failed) either way — drop it from the active set."""
+    signals.end_task(tool_use_id)
+    return {}
+
+
+# Registered unconditionally, in every permission_mode including
+# bypassPermissions — see path_guard.py for why this has to be a
+# PreToolUse hook rather than living in the can_use_tool gate below.
+# The task-tracking hooks ride the same mechanism for the same reason:
+# a hook fires for every tool call regardless of permission_mode, which
+# a purely stream-based guess (the old approach) can't rely on. An empty
+# config.blocked_paths makes guard_blocked_paths itself a no-op per
+# call, so none of this costs anything extra when unused.
+_HOOKS = {
+    "PreToolUse": [HookMatcher(matcher=None,
+                                hooks=[guard_blocked_paths, _task_start_hook])],
+    "PostToolUse": [HookMatcher(matcher=None, hooks=[_task_end_hook])],
+    "PostToolUseFailure": [HookMatcher(matcher=None, hooks=[_task_end_hook])],
+}
+
+# How long ask_stream will wait for ANY stream activity (not the whole
+# turn — a heavy tool call, e.g. reviewing dozens of image frames, can
+# legitimately go quiet for a while mid-turn) before presuming the CLI
+# subprocess itself has stalled and rebuilding rather than hanging
+# forever. Field case: a 40-frame video review choked the pipe, and
+# ask_stream had no bound at all, so the voice line just sat dead.
+_ASK_IDLE_TIMEOUT = 240
+
+# The SDK's subprocess transport caps a single JSON stdout message at
+# 1MB by default and kills the pipe past that ("JSON message exceeded
+# maximum buffer size"), which reset_turn can't recover from — it reads
+# as a dead pipe and rebuilds the whole session, wiping conversation
+# memory. A single oversized tool result (a big ptt payload, a large
+# image/doc read) can trip that default. 10x headroom.
+_MAX_BUFFER_SIZE = 10 * 1024 * 1024
 
 
 SESSION_FILE = os.path.join(CFG["signals_dir"], ".backtalk_session")
@@ -80,9 +154,12 @@ class WarmBrain:
         mode = CFG["permission_mode"]
         if mode == "default":
             mode = "ask"     # legacy alias, see config.py
-        # backtalk's "ask" = the SDK's "default" mode with gated calls
-        # routed to the spoken can_use_tool gate.
-        sdk_mode = "default" if mode == "ask" else mode
+        # backtalk's "ask" AND "confirm_risk" both = the SDK's "default"
+        # mode, gated calls routed to the can_use_tool gate either way —
+        # "confirm_risk" still needs every gated call to reach the gate,
+        # it just decides per-call there whether to ask or wave it
+        # through, instead of asking every time like "ask" does.
+        sdk_mode = "default" if mode in ("ask", "confirm_risk") else mode
         if sdk_mode == "bypassPermissions" and self._can_use_tool \
                 and CanUseToolShadowedWarning:
             # Deliberate auto-approve: the SDK warns that the callback is
@@ -103,6 +180,8 @@ class WarmBrain:
                 add_dirs=CFG["extra_dirs"],
                 skills=CFG["visible_skills"],
                 resume=rid,
+                max_buffer_size=_MAX_BUFFER_SIZE,
+                hooks=_HOOKS,
             )
         if resume:
             try:
@@ -286,6 +365,16 @@ class WarmBrain:
 
         try:
             drained = await asyncio.wait_for(_drain(), timeout)
+            if drained == 0:
+                # A genuinely resynced pipe always yields at least the
+                # dead turn's leftover ResultMessage (per the docstring
+                # above). Zero means there was nothing left to find
+                # because the subprocess connection itself is gone, not
+                # that the pipe happened to already be aligned — every
+                # healthy interrupt in the field logs drains 2+ messages,
+                # never 0. Fall through to the same rebuild as a timeout.
+                raise RuntimeError("drain returned zero messages — "
+                                    "pipe is dead, not just desynced")
             log(f"[brain] interrupted turn drained ({drained} stale messages)")
             self._dirty = False
         except Exception:
@@ -295,61 +384,96 @@ class WarmBrain:
             # rest of the day.
             log("[brain] stream desynced beyond repair — rebuilding the "
                 "session (conversation memory for this session resets)")
-            try:
-                await self._client.disconnect()
-            except Exception:
-                pass
-            self._client = None
-            await self.start()
-            self._dirty = False
+            await self._rebuild_session()
 
     async def stop(self):
         if self._client:
             await self._client.disconnect()
             self._client = None
 
+    async def _rebuild_session(self):
+        """Disconnect and reconnect fresh. Loses this voice session's
+        conversation memory; called only once the pipe to the CLI
+        subprocess is confirmed dead, never for a routine resync."""
+        try:
+            await self._client.disconnect()
+        except Exception:
+            pass
+        self._client = None
+        await self.start()
+        self._dirty = False
+
     async def ask_stream(self, utterance: str):
-        """Yield complete sentences as they stream out of the model."""
+        """Yield complete sentences as they stream out of the model.
+
+        Bounded by _ASK_IDLE_TIMEOUT per message, not per turn: a slow
+        but ALIVE tool call (a big image review, a web fetch) can go
+        quiet for a while and that's fine, but a subprocess that never
+        produces another message again is a dead pipe, and this used to
+        have no bound at all — a stalled turn just hung the voice line
+        forever with no recovery short of killing the process."""
         self._dirty = True             # in flight until its ResultMessage
         await self._client.query(utterance)
         buf = ""
-        async for msg in self._client.receive_response():
-            t = type(msg).__name__
-            if t == "StreamEvent":
-                ev = getattr(msg, "event", {}) or {}
-                if ev.get("type") == "content_block_delta":
-                    delta = ev.get("delta", {}) or {}
-                    if delta.get("type") == "text_delta":
-                        buf += delta.get("text", "")
-                        # emit any complete sentences
-                        while True:
-                            m = _SENTENCE_END.search(buf)
-                            if not m:
-                                break
-                            sentence, buf = (buf[:m.end()].strip(),
-                                             buf[m.end():])
-                            if sentence:
-                                yield sentence
-                elif ev.get("type") == "content_block_stop":
-                    # End of a speech block (e.g. right before a tool
-                    # call): flush NOW. Without this, pre-tool filler
-                    # ("On it — let me grab that.") sits silent in the
-                    # buffer through the whole tool run, then plays
-                    # glued to the answer: long dead air, then two
-                    # thoughts at once.
-                    tail = buf.strip()
-                    buf = ""
-                    if tail:
-                        yield tail
-            elif t == "ResultMessage":
-                self._dirty = False    # turn fully consumed — pipe aligned
-                self._tally(msg)
-                self._remember_session(msg)
-                await self._pull_rate_limits()
-                break
-        tail = buf.strip()
-        if tail:
-            yield tail
+        stream = self._client.receive_response()
+        try:
+            while True:
+                try:
+                    msg = await asyncio.wait_for(stream.__anext__(),
+                                                  _ASK_IDLE_TIMEOUT)
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError:
+                    log(f"[brain] ask_stream stalled ({_ASK_IDLE_TIMEOUT}s "
+                        "with no stream activity) — rebuilding the session")
+                    await self._rebuild_session()
+                    yield ("Sorry, I lost the connection mid-turn there. "
+                           "I've reconnected — go ahead and ask again.")
+                    return
+                t = type(msg).__name__
+                if t == "StreamEvent":
+                    ev = getattr(msg, "event", {}) or {}
+                    etype = ev.get("type")
+                    if etype == "content_block_delta":
+                        delta = ev.get("delta", {}) or {}
+                        if delta.get("type") == "text_delta":
+                            buf += delta.get("text", "")
+                            # emit any complete sentences
+                            while True:
+                                m = _SENTENCE_END.search(buf)
+                                if not m:
+                                    break
+                                sentence, buf = (buf[:m.end()].strip(),
+                                                 buf[m.end():])
+                                if sentence:
+                                    yield sentence
+                    elif etype == "content_block_stop":
+                        # End of a speech block (e.g. right before a tool
+                        # call): flush NOW. Without this, pre-tool filler
+                        # ("On it — let me grab that.") sits silent in the
+                        # buffer through the whole tool run, then plays
+                        # glued to the answer: long dead air, then two
+                        # thoughts at once.
+                        tail = buf.strip()
+                        buf = ""
+                        if tail:
+                            yield tail
+                elif t == "ResultMessage":
+                    self._dirty = False    # turn fully consumed — pipe aligned
+                    self._tally(msg)
+                    self._remember_session(msg)
+                    await self._pull_rate_limits()
+                    break
+            tail = buf.strip()
+            if tail:
+                yield tail
+        finally:
+            # Always clear, even on a stall/rebuild or an exception mid-turn
+            # — a stuck "Running a command" is worse than showing nothing.
+            # The hooks above should have already removed every task that
+            # finished cleanly; this is only the safety net for one that
+            # didn't (a killed subprocess, a dropped PostToolUse event).
+            signals.clear_all_tasks()
 
 
 if __name__ == "__main__":

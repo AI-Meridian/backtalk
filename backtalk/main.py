@@ -210,12 +210,62 @@ def _full_detail(tool, tool_input, ctx):
     return f"use {name}" + (f", {desc[:70]}" if desc else "")
 
 
+# ---- RISK CLASSIFICATION for permission_mode "confirm_risk": which
+# gated calls are safe to wave through silently vs which still need the
+# spoken ask. Defaults to False (ask) for anything not explicitly
+# cleared below -- the safe direction to be wrong in, same reasoning as
+# the Bash allowlist itself. A reversible call is one that either
+# touches nothing on disk, or touches only a file inside the agent's
+# own vault/home (recoverable, not a system file).
+_SAFE_BASH_PREFIXES = (
+    "ls", "pwd", "cat", "head", "tail", "grep", "find", "wc",
+    "which", "whoami", "date", "df", "du", "ps", "env", "printenv",
+    "echo", "git status", "git log", "git diff", "git show",
+    "git branch",
+)
+
+
+def _is_reversible(tool, tool_input):
+    """True only for a gated call safe to auto-allow under
+    permission_mode "confirm_risk". Read-only tools and Write/Edit
+    inside the agent's own agent_dir/extra_dirs are reversible. Bash is
+    allowlisted against known-safe read-only prefixes ONLY, never
+    denylisted against known-dangerous ones -- see the config.py
+    comment on permission_mode for why. A chained/piped command
+    (`&&`, `|`, `;`, backticks, `$(...)`) never auto-allows even with a
+    safe-looking prefix, since anything could follow the visible part."""
+    d = tool_input or {}
+    if tool in ("Read", "Glob", "Grep", "WebFetch", "WebSearch"):
+        return True
+    if tool in ("Write", "Edit", "NotebookEdit"):
+        path = str(d.get("file_path") or d.get("notebook_path")
+                   or "").replace("\\", "/")
+        if not path:
+            return False
+        homes = [CFG.get("agent_dir", "")] + list(CFG.get("extra_dirs")
+                                                    or [])
+        return any(h and path.startswith(str(h).rstrip("/") + "/")
+                   for h in homes if h)
+    if tool == "Bash":
+        cmd = " ".join(str(d.get("command", "")).split()).strip()
+        if not cmd or any(m in cmd for m in _CHAIN_MARKS):
+            return False
+        # word-boundary match only: "ls" must not clear "lsof"/"lsblk"
+        return any(cmd == p or cmd.startswith(p + " ")
+                   for p in _SAFE_BASH_PREFIXES)
+    return False
+
+
 def make_permission_gate(mouth):
     from claude_agent_sdk import (PermissionResultAllow,
                                   PermissionResultDeny)
 
     async def gate(tool, tool_input, ctx):
         if _AUTOAPPROVE["on"]:
+            return PermissionResultAllow(behavior="allow")
+        if (CFG["permission_mode"] == "confirm_risk"
+                and _is_reversible(tool, tool_input)):
+            log(f"[perm]   auto-allowed, reversible: {tool}")
             return PermissionResultAllow(behavior="allow")
         what = _human_what(tool, tool_input, ctx)
         detail = _full_detail(tool, tool_input, ctx)
@@ -791,7 +841,7 @@ async def amain():
                 _MIC["gen"] += 1
                 _write_config_key("mic_mode", "ptt")
                 log("[console] mic_mode -> ptt")
-                key = str(CFG.get("ptt_key", "home")).replace("_", " ")
+                key = str(CFG.get("ptt_key", "left_ctrl")).replace("_", " ")
                 mouth.say(f"Push to talk. Hold the {key} key and "
                           "talk; the mic stays closed otherwise.")
         elif verb == "noask":

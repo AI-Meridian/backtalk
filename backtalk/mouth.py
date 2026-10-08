@@ -43,6 +43,7 @@ import os
 import queue
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -342,6 +343,7 @@ class Mouth:
         # Worker-thread-only — never touch from other threads.
         self._out: sd.OutputStream | None = None
         self._out_rate: int | None = None
+        self._out_device_name: str | None = None
         self.ducker = Ducker()  # public: PTT ducks for the USER's voice too
         self._worker = threading.Thread(target=self._run, daemon=True)
         self._worker.start()
@@ -416,11 +418,56 @@ class Mouth:
                     self.ducker.speech_end()
                     signals.set_state("idle")
 
+    @staticmethod
+    def _default_output_name() -> str | None:
+        """The system's current default output device name, or None if
+        it can't be read. None means "unknown", not "no device" — callers
+        treat it as no-change-detected rather than forcing a reopen, so a
+        query hiccup never becomes a new failure mode.
+
+        sd.query_devices() asks PortAudio, which only enumerates devices
+        once at init and never notices one appearing later (same root
+        cause ears._reopen_after_device_change exists for) -- so it would
+        keep reporting whatever was default when the process started,
+        never seeing a Bluetooth connect made afterward. SwitchAudioSource
+        asks CoreAudio directly, live, bypassing that cache entirely.
+        Falls back to the PortAudio answer if the tool isn't installed,
+        same as before this fix -- degraded, not broken.
+        """
+        if shutil.which("SwitchAudioSource"):
+            try:
+                name = subprocess.run(
+                    ["SwitchAudioSource", "-c", "-t", "output"],
+                    capture_output=True, text=True, timeout=1,
+                ).stdout.strip()
+                if name:
+                    return name
+            except Exception:
+                pass
+        try:
+            return sd.query_devices(kind="output")["name"]
+        except Exception:
+            return None
+
     def _get_out(self, rate: int) -> sd.OutputStream:
-        """The long-lived stream (audio law #1). Reopened only when the
-        sample rate changes (ElevenLabs 44.1k <-> Kokoro 24k fallback:
-        rare, costs at most one blip on the switch)."""
-        if self._out is not None and self._out_rate == rate:
+        """The long-lived stream (audio law #1). Reopened when the sample
+        rate changes (ElevenLabs 44.1k <-> Kokoro 24k fallback: rare,
+        costs at most one blip on the switch) OR when the system's
+        default output device has changed since this stream was opened
+        (headphones connected/disconnected after we started talking).
+
+        That second case is silent, not an error: unlike the mic, an
+        open OutputStream bound to, say, the built-in speakers does not
+        throw when Bluetooth headphones become the new default -- it
+        just keeps playing to the old device forever, correctly, to the
+        wrong place. So this has to be checked proactively before every
+        sentence rather than caught as a failure the way the mic's
+        device-change recovery is (see ears._reopen_after_device_change).
+        """
+        current_device = self._default_output_name()
+        device_changed = (current_device is not None
+                           and current_device != self._out_device_name)
+        if self._out is not None and self._out_rate == rate and not device_changed:
             # Guarded, because the stream can die UNDER us: the ears
             # rebuild the whole audio system to recover from a device
             # change (see ears._reopen_after_device_change), and that
@@ -434,9 +481,27 @@ class Mouth:
                 return self._out
             except Exception:
                 log("[mouth] the output stream went away, reopening")
+        elif device_changed:
+            log(f"[mouth] default output changed to {current_device!r}, "
+                f"reopening")
+            # a bare sd.OutputStream() below opens against PortAudio's OWN
+            # idea of the default device, which is exactly the stale cache
+            # _default_output_name's live CoreAudio check just caught it
+            # disagreeing with -- without this it would detect the change
+            # correctly and then reopen onto the same wrong device anyway.
+            # Same rebuild ears._reopen_after_device_change uses; it also
+            # kills every other open stream (the mic's included), which is
+            # why that path already has its own recovery for this.
+            try:
+                sd._terminate()
+            except Exception:
+                pass
+            sd._initialize()
         self._drop_out()
         self._out = sd.OutputStream(samplerate=rate, channels=1, dtype="int16")
         self._out_rate = rate
+        self._out_device_name = current_device if current_device is not None \
+            else self._default_output_name()
         self._out.start()
         return self._out
 
@@ -464,6 +529,7 @@ class Mouth:
                 pass
         self._out = None
         self._out_rate = None
+        self._out_device_name = None
 
     def _play_stream(self, sentence: str, directions=None, block: int = 2205,
                      prebuffer_s: float = 0.75):

@@ -22,9 +22,16 @@ is the whole integration surface:
 
   .voice_state        idle | listening | thinking | speaking
   .voice_waveform     JSON {ts, samples: [64 floats]} while audio plays
+  .voice_input_waveform  JSON {ts, samples: [64 floats]} while the mic
+                      is open and listening for an utterance
   .voice_loading_pid  exists while the thinking sound is playing
   .voice_rate_limits  JSON {window: {utilization, resets_at}} — only
                       written when show_usage is on
+  .voice_task         JSON list of {id, ts, label} — one entry per tool
+                      call currently executing. Several entries at once
+                      means several tools are genuinely running in
+                      parallel, not a display glitch. Empty/absent means
+                      nothing running right now.
 
 Written to signals_dir (default: the repo root). Visualizers built on
 this contract just work.
@@ -49,10 +56,12 @@ from backtalk.config import CFG
 _DIR = CFG["signals_dir"]
 _STATE_FILE = os.path.join(_DIR, ".voice_state")
 _WAVEFORM_FILE = os.path.join(_DIR, ".voice_waveform")
+_INPUT_WAVEFORM_FILE = os.path.join(_DIR, ".voice_input_waveform")
 _LOADING_PID_FILE = os.path.join(_DIR, ".voice_loading_pid")
 _DIRECTION_FILE = os.path.join(_DIR, ".voice_direction")
 _REPLY_DONE_FILE = os.path.join(_DIR, ".voice_reply_done")
 _RATE_LIMIT_FILE = os.path.join(_DIR, ".voice_rate_limits")
+_TASK_FILE = os.path.join(_DIR, ".voice_task")
 
 _BH = CFG.get("barehands_state_dir") or ""
 _BH_STATE = os.path.join(_BH, "state") if _BH else ""
@@ -62,6 +71,7 @@ _THINKING_SOUND = CFG.get("thinking_sound") or ""
 
 _WAVEFORM_MIN_INTERVAL = 1.0 / 15   # ~15 writes/sec is plenty for 60fps reads
 _last_waveform_write = 0.0
+_last_input_waveform_write = 0.0
 _static_proc: subprocess.Popen | None = None
 
 
@@ -78,6 +88,48 @@ def set_state(name: str):
                 f.write(name)
         except OSError:
             pass
+
+
+# The active set of tool calls, keyed by the SDK's own tool_use_id so
+# calls that genuinely overlap (parallel tool use in one turn) each get
+# tracked independently instead of clobbering a single shared slot —
+# that clobbering was the real bug behind the old "task panel isn't
+# consistently on" complaint: a second tool starting before the first
+# one's content_block_stop fired would just overwrite the first's label.
+_tasks: dict[str, dict] = {}
+
+
+def _write_tasks():
+    try:
+        if _tasks:
+            with open(_TASK_FILE, "w") as f:
+                json.dump(list(_tasks.values()), f)
+        else:
+            os.remove(_TASK_FILE)
+    except OSError:
+        pass
+
+
+def start_task(task_id: str, label: str):
+    """A tool call started executing — add it to the active set, in
+    plain English ("Reading a file"), for a face to show while the
+    brain is quietly working instead of talking. Never raises."""
+    _tasks[task_id] = {"id": task_id, "ts": time.time(), "label": label}
+    _write_tasks()
+
+
+def end_task(task_id: str):
+    """That tool call finished (or failed) — drop it from the active
+    set. Never raises."""
+    _tasks.pop(task_id, None)
+    _write_tasks()
+
+
+def clear_all_tasks():
+    """Safety net for a stall/rebuild/exception mid-turn: wipe every
+    active task rather than leave a stuck entry on screen forever."""
+    _tasks.clear()
+    _write_tasks()
 
 
 def feed_waveform(pcm: np.ndarray):
@@ -106,6 +158,29 @@ def feed_waveform(pcm: np.ndarray):
     except (OSError, ValueError):
         pass
     set_state("speaking")
+
+
+def feed_input_waveform(pcm: np.ndarray):
+    """Feed one PCM block (int16) from the open mic — throttled,
+    downsampled to 64 points, same shape as feed_waveform's output file.
+
+    Deliberately does not touch .voice_state: ears.py's callers already
+    own that transition, and this is just a loudness feed for whoever's
+    listening to it, not a state signal."""
+    global _last_input_waveform_write
+    if pcm.size == 0:
+        return
+    now = time.time()
+    if now - _last_input_waveform_write < _WAVEFORM_MIN_INTERVAL:
+        return
+    _last_input_waveform_write = now
+    try:
+        idx = np.linspace(0, pcm.size - 1, 64).astype(int)
+        raw = pcm[idx].astype(float)
+        with open(_INPUT_WAVEFORM_FILE, "w") as f:
+            f.write(json.dumps({"ts": now, "samples": raw.tolist()}))
+    except (OSError, ValueError):
+        pass
 
 
 def direction(items):

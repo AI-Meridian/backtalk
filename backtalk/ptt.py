@@ -50,8 +50,8 @@ from pynput import keyboard
 
 
 def resolve_key(name: str):
-    """'home' / 'f13' / 'right_alt' / any single character -> pynput key."""
-    name = (name or "home").strip().lower()
+    """'left_ctrl' / 'f13' / 'right_alt' / any single character -> pynput key."""
+    name = (name or "left_ctrl").strip().lower()
     if len(name) == 1:
         return keyboard.KeyCode.from_char(name)
     # Friendly names -> pynput's names. pynput calls the right option key
@@ -69,9 +69,10 @@ def resolve_key(name: str):
     try:
         return getattr(keyboard.Key, name)
     except AttributeError:
-        print(f"[ptt] unknown key {name!r} — falling back to 'home'",
+        print(f"[ptt] unknown key {name!r} — falling back to left_ctrl "
+              f"(never 'home', which many laptop keyboards lack)",
               flush=True)
-        return keyboard.Key.home
+        return keyboard.Key.ctrl_l
 
 
 class PTTListener:
@@ -81,7 +82,7 @@ class PTTListener:
     # is ~30ms) and short enough that letting go still feels instant.
     RELEASE_GRACE = 0.12
 
-    def __init__(self, key="home"):
+    def __init__(self, key="left_ctrl"):
         self._key = resolve_key(key) if isinstance(key, str) else key
         self._held = False
         self._release_t = None          # a release awaiting confirmation

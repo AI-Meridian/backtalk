@@ -353,6 +353,8 @@ class Ears:
         frame; returning True closes the mic and returns None, which
         is how a live switch back to push-to-talk shuts the open mic
         down promptly instead of after one more utterance."""
+        from backtalk import signals
+
         frames: list[np.ndarray] = []
         ring: list[np.ndarray] = []   # pre-roll so the first syllable survives
         speech_run = 0
@@ -370,6 +372,7 @@ class Ears:
                 if timeout_s and elapsed > timeout_s and not in_utterance:
                     return None
                 mono = block[:, 0].copy()
+                signals.feed_input_waveform(mono)
                 if gate and gate():
                     # speakers are talking and barge-in isn't on: ignore
                     ring.clear()
@@ -403,7 +406,7 @@ class Ears:
                         return transcribe(np.concatenate(frames))
 
 
-def record_held(is_held, max_s: float = 60.0, min_s: float = 0.25) -> str | None:
+def record_held(is_held, max_s: float = 90.0, min_s: float = 0.25) -> str | None:
     """Hold-to-talk capture: record raw audio while is_held() is True,
     then transcribe. The button is the VAD — no endpointing. Returns
     None for taps shorter than min_s (accidental presses)."""
