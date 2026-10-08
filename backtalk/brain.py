@@ -73,13 +73,28 @@ def _task_label(tool_name: str) -> str:
                              else "Working")
 
 
+def _task_eta(tool_name: str, tool_input: dict) -> float | None:
+    """Best-effort duration estimate, seconds, for a face to render a
+    real progress bar against — not a guess invented here, just the
+    timeout the tool call itself already carries. Bash is the only
+    built-in tool with a caller-set duration budget (ms); the SDK's own
+    documented default is 120000ms when the caller didn't pass one."""
+    if tool_name != "Bash":
+        return None
+    timeout_ms = tool_input.get("timeout") or 120_000
+    return timeout_ms / 1000.0
+
+
 async def _task_start_hook(input_data, tool_use_id, context):
     """PreToolUse hook: mark this call as running the moment the SDK
     actually dispatches it for execution, keyed by the SDK's own
     tool_use_id rather than guessed from the raw content-block stream.
     Parallel tool calls each get their own id, so they show up as
     independent entries instead of racing to overwrite one slot."""
-    signals.start_task(tool_use_id, _task_label(input_data.get("tool_name", "")))
+    tool_name = input_data.get("tool_name", "")
+    tool_input = input_data.get("tool_input") or {}
+    signals.start_task(tool_use_id, _task_label(tool_name),
+                        eta=_task_eta(tool_name, tool_input))
     return {}
 
 

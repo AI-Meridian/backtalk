@@ -27,11 +27,13 @@ is the whole integration surface:
   .voice_loading_pid  exists while the thinking sound is playing
   .voice_rate_limits  JSON {window: {utilization, resets_at}} — only
                       written when show_usage is on
-  .voice_task         JSON list of {id, ts, label} — one entry per tool
-                      call currently executing. Several entries at once
-                      means several tools are genuinely running in
+  .voice_task         JSON list of {id, ts, label, eta} — one entry per
+                      tool call currently executing. Several entries at
+                      once means several tools are genuinely running in
                       parallel, not a display glitch. Empty/absent means
-                      nothing running right now.
+                      nothing running right now. `eta` (seconds, may be
+                      null) lets a face show a real progress bar for a
+                      long job instead of just an elapsed-time spinner.
 
 Written to signals_dir (default: the repo root). Visualizers built on
 this contract just work.
@@ -117,11 +119,14 @@ def _write_tasks():
         pass
 
 
-def start_task(task_id: str, label: str):
+def start_task(task_id: str, label: str, eta: float | None = None):
     """A tool call started executing — add it to the active set, in
     plain English ("Reading a file"), for a face to show while the
-    brain is quietly working instead of talking. Never raises."""
-    _tasks[task_id] = {"id": task_id, "ts": time.time(), "label": label}
+    brain is quietly working instead of talking. `eta` (seconds) lets a
+    long job carry a real progress estimate; omit it for anything whose
+    duration isn't known up front. Never raises."""
+    _tasks[task_id] = {"id": task_id, "ts": time.time(), "label": label,
+                        "eta": eta}
     _write_tasks()
 
 
