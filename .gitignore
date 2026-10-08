@@ -14,6 +14,10 @@ backtalk.egg-info/
 # your personal config, created at setup: never tracked, never touched by updates
 backtalk.json
 
+# the pre-rendered filler clip, generated per install in each person's own
+# voice (gen_filler.py) — never a shared asset, never someone else's voice
+assets/filler_ack.wav
+
 # Other agents' configs living beside this one. They are not backtalk's, they are
 # not the user's copy of backtalk's, and nothing here should ever carry them.
 earl.json

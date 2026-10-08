@@ -47,6 +47,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 
 import numpy as np
@@ -68,11 +69,17 @@ _BH_STATE = os.path.join(_BH, "state") if _BH else ""
 _BH_WAVE = os.path.join(_BH, "wave.json") if _BH else ""
 
 _THINKING_SOUND = CFG.get("thinking_sound") or ""
+_FILLER_SOUND = CFG.get("filler_sound") or ""
+try:
+    _FILLER_DELAY = float(CFG.get("filler_delay") or 0)
+except (TypeError, ValueError):
+    _FILLER_DELAY = 0.0
 
 _WAVEFORM_MIN_INTERVAL = 1.0 / 15   # ~15 writes/sec is plenty for 60fps reads
 _last_waveform_write = 0.0
 _last_input_waveform_write = 0.0
 _static_proc: subprocess.Popen | None = None
+_filler_timer: threading.Timer | None = None
 
 
 def set_state(name: str):
@@ -262,12 +269,40 @@ def _player_cmd(path: str) -> list[str] | None:
     return None
 
 
+def _play_filler():
+    """Fires once, _FILLER_DELAY seconds after static_start(), if nothing
+    has called static_stop() in the meantime — i.e. the agent is still
+    thinking well past the point thinking_sound's one-shot clip ran out.
+    Fire-and-forget: never tracked in _static_proc, so static_stop()
+    cutting off the (already-finished) thinking sound never kills this."""
+    if not _FILLER_SOUND or not os.path.exists(_FILLER_SOUND):
+        return
+    cmd = _player_cmd(_FILLER_SOUND)
+    if not cmd:
+        return
+    try:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
 def static_start():
-    """Optional thinking sound — plays while the brain works."""
-    global _static_proc
+    """Optional thinking sound — plays while the brain works. Also arms
+    the filler-line timer (see _play_filler) regardless of whether a
+    thinking sound is even configured, since the filler's whole job is
+    covering the silence after it, not depending on it existing."""
+    global _static_proc, _filler_timer
+    if _filler_timer is not None:
+        _filler_timer.cancel()
+        _filler_timer = None
+    if _FILLER_SOUND and _FILLER_DELAY > 0:
+        _filler_timer = threading.Timer(_FILLER_DELAY, _play_filler)
+        _filler_timer.daemon = True
+        _filler_timer.start()
     if not _THINKING_SOUND or not os.path.exists(_THINKING_SOUND):
         return
-    static_stop()
+    static_stop(_cancel_filler=False)
     cmd = _player_cmd(_THINKING_SOUND)
     if not cmd:
         return
@@ -280,8 +315,8 @@ def static_start():
         _static_proc = None
 
 
-def static_stop():
-    global _static_proc
+def static_stop(_cancel_filler: bool = True):
+    global _static_proc, _filler_timer
     if _static_proc is not None:
         try:
             _static_proc.terminate()
@@ -292,3 +327,6 @@ def static_stop():
         os.remove(_LOADING_PID_FILE)
     except OSError:
         pass
+    if _cancel_filler and _filler_timer is not None:
+        _filler_timer.cancel()
+        _filler_timer = None

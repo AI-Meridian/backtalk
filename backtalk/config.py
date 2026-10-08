@@ -222,6 +222,19 @@ DEFAULTS = {
     # a dead line. The bundled one ships in assets/; a relative path
     # resolves against this repo. Set "" to think in silence.
     "thinking_sound": "assets/thinking.wav",
+    # A short pre-recorded line in the agent's own voice ("Still working
+    # on that, sir"), played once if thinking_sound finishes and the
+    # agent is STILL thinking — thinking_sound is a one-shot, non-looping
+    # clip, so on a task that outlasts it the line would otherwise go
+    # dead silent until the real reply starts. Pre-recorded, not synthesized
+    # live, so playing it costs zero extra latency. Set "" to disable.
+    "filler_sound": "assets/filler_ack.wav",
+    # Seconds after thinking starts before the filler line plays, if still
+    # thinking. Set to roughly thinking_sound's own duration (a little
+    # under it, so there's no gap) — it only ever plays on a turn that
+    # runs longer than that anyway, since static_stop() cancels it the
+    # moment real speech starts.
+    "filler_delay": 9.0,
     # Spoken lines. {name} is replaced with "name" above.
     "greeting": "Voice line online. Hold {ptt_key} and talk to me.",
     # Spoken instead of "greeting" when mic_mode is "open", where telling
@@ -296,6 +309,10 @@ def load() -> dict:
     if thinking and not os.path.isabs(thinking):
         thinking = str(REPO / thinking)
     cfg["thinking_sound"] = thinking
+    filler = _expand(cfg.get("filler_sound", ""))
+    if filler and not os.path.isabs(filler):
+        filler = str(REPO / filler)
+    cfg["filler_sound"] = filler
     name = str(cfg.get("name") or "Assistant")
     low = name.lower()
     cfg["quit_phrases"] = tuple(cfg.get("quit_phrases") or (
