@@ -70,7 +70,7 @@ Run `./run.sh` for them and walk the checklist out loud, one step at a time:
 2. Hold the key, "ask it anything", release. Answer inside ~2 seconds.
 3. Interrupt it mid-reply with the key. It stops within a syllable.
 4. Interrupt, then immediately ask something NEW, and confirm the answer matches the NEW question. **Do this three times.** (This is the interrupt-desync armor proving itself; it's the test naive voice builds fail.)
-5. Ask something that needs a tool; it should speak filler, then the answer.
+5. Ask something that needs a tool; the thinking sound plays, then the answer (the filler-line fallback was removed; a long-running tool call shows progress on the task panel, not as audio).
 6. Type a line in the terminal: spoken reply, same conversation.
 7. Say "usage report": it speaks the session's turns and tokens, plus rough cost when the API reports one.
 7b. If they chose push to talk, say "go hands free": hands-free listening comes on with a spoken explanation; an unheld sentence reaches the agent; "push to talk mode" brings the button back. (Chose hands-free at setup? Run it the other way around.)

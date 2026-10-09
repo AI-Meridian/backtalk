@@ -86,7 +86,7 @@ Three land mines with warning signs on them; do not "simplify" these away:
 2. Hold the key, ask something, release → answer within ~2s.
 3. Interrupt mid-reply with the key → it stops within a syllable.
 4. Interrupt, then ask something NEW → the answer matches the NEW question (repeat 3×: that's the stream drain proving itself).
-5. Ask something that needs a tool ("what's in my notes about X") → it speaks filler within a couple of seconds, then the answer.
+5. Ask something that needs a tool ("what's in my notes about X") → the thinking sound plays, then the answer (the filler-line fallback was removed; a long-running tool call shows progress on the task panel, not as audio).
 6. Type a message in the terminal → spoken reply, same conversation.
 7. Say "usage report" → it speaks turns and tokens (plus cost when the API reports one).
 8. In ask mode: request a small file write → the spoken permission check plays → "yes" proceeds, and a second attempt answered "no" stands down.
