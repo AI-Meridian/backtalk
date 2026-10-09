@@ -117,6 +117,18 @@ _tasks: dict[str, dict] = {}
 # agent and kept talking), and must not wipe a job that is deliberately
 # still running after the voice line has gone quiet again.
 _subagent_tasks: dict[str, dict] = {}
+# Guards every read/write of _subagent_tasks: it's the only task dict
+# touched from two different threads (the event loop, via
+# start/end_subagent_task, and this module's own heartbeat daemon) —
+# _tasks never needs this, nothing but the event loop ever touches it.
+# Without this lock, the heartbeat's own `for entry in
+# _subagent_tasks.values(): ...` can raise "dictionary changed size
+# during iteration" if a subagent starts/stops mid-tick, which — with
+# no try/except around the loop body — killed the daemon thread
+# silently and permanently, so every background-agent row would go
+# stale and vanish from the task panel within 30s even though the
+# agent was still genuinely running. Reproduced before this fix.
+_subagent_lock = threading.Lock()
 _heartbeat_thread: threading.Thread | None = None
 _HEARTBEAT_INTERVAL = 10.0   # well under ai-visualizer's 30s stale_limit
 
@@ -146,7 +158,9 @@ def _record_done(entry: dict):
 
 def _write_tasks():
     try:
-        merged = list(_tasks.values()) + list(_subagent_tasks.values())
+        with _subagent_lock:
+            subagent_list = list(_subagent_tasks.values())
+        merged = list(_tasks.values()) + subagent_list
         if merged:
             with open(_TASK_FILE, "w") as f:
                 json.dump(merged, f)
@@ -195,12 +209,20 @@ def _heartbeat_loop():
     actually started, not a reset clock."""
     while True:
         time.sleep(_HEARTBEAT_INTERVAL)
-        if not _subagent_tasks:
-            continue
-        now = time.time()
-        for entry in _subagent_tasks.values():
-            entry["hb"] = now
-        _write_tasks()
+        try:
+            with _subagent_lock:
+                if not _subagent_tasks:
+                    continue
+                now = time.time()
+                for entry in _subagent_tasks.values():
+                    entry["hb"] = now
+            _write_tasks()
+        except Exception:
+            # Belt and suspenders on top of the lock above: whatever
+            # happens, this loop must never die silently — a background
+            # agent's row going stale because the heartbeat thread
+            # quietly dies is exactly the bug this file exists to avoid.
+            pass
 
 
 def start_subagent_task(agent_id: str, label: str):
@@ -210,8 +232,9 @@ def start_subagent_task(agent_id: str, label: str):
     Never raises."""
     global _heartbeat_thread
     now = time.time()
-    _subagent_tasks[agent_id] = {"id": agent_id, "ts": now, "hb": now,
-                                  "label": label, "eta": None}
+    with _subagent_lock:
+        _subagent_tasks[agent_id] = {"id": agent_id, "ts": now, "hb": now,
+                                      "label": label, "eta": None}
     if _heartbeat_thread is None or not _heartbeat_thread.is_alive():
         _heartbeat_thread = threading.Thread(target=_heartbeat_loop,
                                               daemon=True)
@@ -222,7 +245,8 @@ def start_subagent_task(agent_id: str, label: str):
 def end_subagent_task(agent_id: str):
     """That background agent (SubagentStop) is done — drop it and
     record it as the newest completion. Never raises."""
-    entry = _subagent_tasks.pop(agent_id, None)
+    with _subagent_lock:
+        entry = _subagent_tasks.pop(agent_id, None)
     if entry is not None:
         _record_done(entry)
     _write_tasks()
