@@ -339,6 +339,13 @@ class Mouth:
         self._q: queue.Queue = queue.Queue()
         self._stop = threading.Event()
         self._speaking = threading.Event()
+        # Set by shut_up() so _run()'s own cleanup knows this stop was a
+        # barge-in/interrupt, not speech finishing naturally — the caller
+        # (main.py's handle()) is about to write a real new state right
+        # after shut_up() returns, and _run() writing "idle" itself a
+        # moment later would race ahead of that and clobber it, leaving
+        # the state stuck on idle for the rest of a long tool-heavy turn.
+        self._interrupted = False
         # The one persistent output stream (audio law #1).
         # Worker-thread-only — never touch from other threads.
         self._out: sd.OutputStream | None = None
@@ -371,6 +378,7 @@ class Mouth:
 
     def shut_up(self):
         """Barge-in: stop current playback and flush everything queued."""
+        self._interrupted = True
         self._stop.set()
         try:
             while True:
@@ -401,6 +409,12 @@ class Mouth:
             if not sentence:
                 continue
             self._stop.clear()
+            # A shut_up() that landed while nothing was actually playing
+            # (the gap between sentences, mid-tool-call) sets this flag
+            # with no in-flight finally block to consume it. Reset it HERE
+            # so that stale flag can't leak into THIS new item's own
+            # completion and wrongly suppress its legitimate idle write.
+            self._interrupted = False
             self._speaking.set()
             self.ducker.speech_start()
             signals.static_stop()     # thinking sound dies when speech starts
@@ -412,11 +426,16 @@ class Mouth:
             finally:
                 if self._q.empty():
                     self._speaking.clear()
-                    # The reply has genuinely stopped talking, as opposed to
-                    # the gap between two sentences of the same reply.
-                    signals.reply_done()
                     self.ducker.speech_end()
-                    signals.set_state("idle")
+                    if not self._interrupted:
+                        # The reply has genuinely stopped talking, as
+                        # opposed to the gap between two sentences of the
+                        # same reply.
+                        signals.reply_done()
+                        signals.set_state("idle")
+                    # else: a barge-in. handle() is already writing the
+                    # new turn's real state right after shut_up() — don't
+                    # race it with a stale idle write.
 
     @staticmethod
     def _default_output_name() -> str | None:

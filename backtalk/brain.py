@@ -33,6 +33,7 @@ import os
 import re
 import warnings
 from datetime import datetime
+from pathlib import Path
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, HookMatcher
 
@@ -68,7 +69,55 @@ _TOOL_LABELS = {
 }
 
 
-def _task_label(tool_name: str) -> str:
+_MAX_LABEL_LEN = 72
+
+
+def _truncate(s: str, limit: int = _MAX_LABEL_LEN) -> str:
+    s = " ".join(s.split())
+    return s if len(s) <= limit else s[: limit - 1].rstrip() + "…"
+
+
+def _task_label(tool_name: str, tool_input: dict | None = None) -> str:
+    """A specific, real-time label built from this exact call's own
+    input, not a generic per-tool-type phrase — the task panel should
+    read like a live line of what's actually happening (the real file,
+    the real command, the real search term), the same way Claude Code's
+    own terminal output does, not a static word that never changes
+    across an entire turn."""
+    ti = tool_input or {}
+    if tool_name == "Read":
+        p = ti.get("file_path", "")
+        return f"Reading {Path(p).name}" if p else _TOOL_LABELS["Read"]
+    if tool_name == "Write":
+        p = ti.get("file_path", "")
+        return f"Writing {Path(p).name}" if p else _TOOL_LABELS["Write"]
+    if tool_name == "Edit":
+        p = ti.get("file_path", "")
+        return f"Editing {Path(p).name}" if p else _TOOL_LABELS["Edit"]
+    if tool_name == "NotebookEdit":
+        p = ti.get("notebook_path", "")
+        return f"Editing {Path(p).name}" if p else _TOOL_LABELS["NotebookEdit"]
+    if tool_name == "Bash":
+        cmd = (ti.get("description") or ti.get("command") or "").strip()
+        return _truncate(cmd) if cmd else _TOOL_LABELS["Bash"]
+    if tool_name == "Glob":
+        pat = ti.get("pattern", "")
+        return _truncate(f"Searching for {pat}") if pat else _TOOL_LABELS["Glob"]
+    if tool_name == "Grep":
+        pat = ti.get("pattern", "")
+        return _truncate(f"Searching for ‘{pat}’") if pat else _TOOL_LABELS["Grep"]
+    if tool_name == "WebSearch":
+        q = ti.get("query", "")
+        return _truncate(f"Searching the web for ‘{q}’") if q else _TOOL_LABELS["WebSearch"]
+    if tool_name == "WebFetch":
+        url = ti.get("url", "")
+        return _truncate(f"Reading {url}") if url else _TOOL_LABELS["WebFetch"]
+    if tool_name in ("Agent", "Task"):
+        desc = ti.get("description", "")
+        return _truncate(f"Delegating: {desc}") if desc else _TOOL_LABELS[tool_name]
+    if tool_name == "SlashCommand":
+        cmd = ti.get("command", "")
+        return _truncate(f"Running {cmd}") if cmd else _TOOL_LABELS["SlashCommand"]
     return _TOOL_LABELS.get(tool_name, f"Working: {tool_name}" if tool_name
                              else "Working")
 
@@ -93,7 +142,7 @@ async def _task_start_hook(input_data, tool_use_id, context):
     independent entries instead of racing to overwrite one slot."""
     tool_name = input_data.get("tool_name", "")
     tool_input = input_data.get("tool_input") or {}
-    signals.start_task(tool_use_id, _task_label(tool_name),
+    signals.start_task(tool_use_id, _task_label(tool_name, tool_input),
                         eta=_task_eta(tool_name, tool_input))
     return {}
 
