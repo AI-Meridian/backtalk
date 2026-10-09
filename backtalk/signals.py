@@ -101,12 +101,23 @@ def set_state(name: str):
 # one's content_block_stop fired would just overwrite the first's label.
 _tasks: dict[str, dict] = {}
 
+# Background agents (SubagentStart/SubagentStop), kept in a separate set
+# from _tasks on purpose: their real lifetime is bounded by their own
+# start/stop pair, not by this turn's — clear_all_tasks() runs at the
+# end of EVERY turn (including the one that just launched a background
+# agent and kept talking), and must not wipe a job that is deliberately
+# still running after the voice line has gone quiet again.
+_subagent_tasks: dict[str, dict] = {}
+_heartbeat_thread: threading.Thread | None = None
+_HEARTBEAT_INTERVAL = 10.0   # well under ai-visualizer's 30s stale_limit
+
 
 def _write_tasks():
     try:
-        if _tasks:
+        merged = list(_tasks.values()) + list(_subagent_tasks.values())
+        if merged:
             with open(_TASK_FILE, "w") as f:
-                json.dump(list(_tasks.values()), f)
+                json.dump(merged, f)
         else:
             os.remove(_TASK_FILE)
     except OSError:
@@ -133,8 +144,51 @@ def end_task(task_id: str):
 
 def clear_all_tasks():
     """Safety net for a stall/rebuild/exception mid-turn: wipe every
-    active task rather than leave a stuck entry on screen forever."""
+    active TOOL-CALL task rather than leave a stuck entry on screen
+    forever. Deliberately leaves _subagent_tasks untouched — a
+    background agent survives past the turn that launched it."""
     _tasks.clear()
+    _write_tasks()
+
+
+def _heartbeat_loop():
+    """Keeps every live background-agent row looking fresh to
+    ai-visualizer's own staleness check, which only knows how to judge
+    a tool call's normal few-second lifetime (or a Bash call's explicit
+    eta) — not a multi-minute agent run with no duration estimate at
+    all. Touches `hb` only, never `ts`, so a face's elapsed-time display
+    (built off `ts`) keeps reporting the real time since the agent
+    actually started, not a reset clock."""
+    while True:
+        time.sleep(_HEARTBEAT_INTERVAL)
+        if not _subagent_tasks:
+            continue
+        now = time.time()
+        for entry in _subagent_tasks.values():
+            entry["hb"] = now
+        _write_tasks()
+
+
+def start_subagent_task(agent_id: str, label: str):
+    """A background/delegated agent (SubagentStart) has begun running
+    independently of this turn's own tool-call stream — track it by its
+    own agent_id so the panel keeps showing it for its real lifetime.
+    Never raises."""
+    global _heartbeat_thread
+    now = time.time()
+    _subagent_tasks[agent_id] = {"id": agent_id, "ts": now, "hb": now,
+                                  "label": label, "eta": None}
+    if _heartbeat_thread is None or not _heartbeat_thread.is_alive():
+        _heartbeat_thread = threading.Thread(target=_heartbeat_loop,
+                                              daemon=True)
+        _heartbeat_thread.start()
+    _write_tasks()
+
+
+def end_subagent_task(agent_id: str):
+    """That background agent (SubagentStop) is done — drop it. Never
+    raises."""
+    _subagent_tasks.pop(agent_id, None)
     _write_tasks()
 
 

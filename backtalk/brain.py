@@ -154,6 +154,33 @@ async def _task_end_hook(input_data, tool_use_id, context):
     return {}
 
 
+async def _subagent_start_hook(input_data, tool_use_id, context):
+    """SubagentStart hook: a delegated agent (e.g. a background Agent-
+    tool dispatch) has begun running on its own, outside this turn's
+    own PreToolUse/PostToolUse pair — that pair ends the instant a
+    background launch call *returns*, not when the agent it kicked off
+    actually finishes, which used to make the task panel flash once and
+    go idle while real work kept running invisibly. Keyed by the SDK's
+    own agent_id, independent of any tool_use_id."""
+    agent_id = input_data.get("agent_id", "")
+    if not agent_id:
+        return {}
+    agent_type = input_data.get("agent_type", "")
+    label = f"Background agent: {agent_type}" if agent_type \
+        else "Background agent"
+    signals.start_subagent_task(agent_id, label)
+    return {}
+
+
+async def _subagent_end_hook(input_data, tool_use_id, context):
+    """SubagentStop hook: that background agent is genuinely done —
+    drop it from the active set."""
+    agent_id = input_data.get("agent_id", "")
+    if agent_id:
+        signals.end_subagent_task(agent_id)
+    return {}
+
+
 # Registered unconditionally, in every permission_mode including
 # bypassPermissions — see path_guard.py for why this has to be a
 # PreToolUse hook rather than living in the can_use_tool gate below.
@@ -167,6 +194,8 @@ _HOOKS = {
                                 hooks=[guard_blocked_paths, _task_start_hook])],
     "PostToolUse": [HookMatcher(matcher=None, hooks=[_task_end_hook])],
     "PostToolUseFailure": [HookMatcher(matcher=None, hooks=[_task_end_hook])],
+    "SubagentStart": [HookMatcher(matcher=None, hooks=[_subagent_start_hook])],
+    "SubagentStop": [HookMatcher(matcher=None, hooks=[_subagent_end_hook])],
 }
 
 # How long ask_stream will wait for ANY stream activity (not the whole
