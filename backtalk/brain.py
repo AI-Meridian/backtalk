@@ -508,6 +508,7 @@ class WarmBrain:
         self._dirty = True             # in flight until its ResultMessage
         await self._client.query(utterance)
         buf = ""
+        writing_blocks: set[int] = set()   # text content-block indices
         stream = self._client.receive_response()
         try:
             while True:
@@ -530,6 +531,16 @@ class WarmBrain:
                     if etype == "content_block_delta":
                         delta = ev.get("delta", {}) or {}
                         if delta.get("type") == "text_delta":
+                            idx = ev.get("index")
+                            if idx not in writing_blocks:
+                                # A text block with no tool call behind it
+                                # (a tool call's own block is input_json_delta,
+                                # never seen here) — give it a task-panel row
+                                # so the panel isn't just empty while the
+                                # model is composing a reply.
+                                writing_blocks.add(idx)
+                                signals.start_task(f"writing-{idx}",
+                                                    "Writing response")
                             buf += delta.get("text", "")
                             # emit any complete sentences
                             while True:
@@ -547,6 +558,10 @@ class WarmBrain:
                         # buffer through the whole tool run, then plays
                         # glued to the answer: long dead air, then two
                         # thoughts at once.
+                        idx = ev.get("index")
+                        if idx in writing_blocks:
+                            writing_blocks.discard(idx)
+                            signals.end_task(f"writing-{idx}")
                         tail = buf.strip()
                         buf = ""
                         if tail:
