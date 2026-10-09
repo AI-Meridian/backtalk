@@ -34,6 +34,14 @@ is the whole integration surface:
                       nothing running right now. `eta` (seconds, may be
                       null) lets a face show a real progress bar for a
                       long job instead of just an elapsed-time spinner.
+  .voice_task_completed  JSON {id, label, completed_ts} — the most
+                      recently FINISHED task (tool call or background
+                      agent), kept around after it leaves .voice_task
+                      so a face can show a persistent "last done" row
+                      instead of a result that just vanishes. Overwritten
+                      by the next completion, never cleared — once
+                      something has finished this run, this file always
+                      names the newest one to finish.
 
 Written to signals_dir (default: the repo root). Visualizers built on
 this contract just work.
@@ -65,6 +73,7 @@ _DIRECTION_FILE = os.path.join(_DIR, ".voice_direction")
 _REPLY_DONE_FILE = os.path.join(_DIR, ".voice_reply_done")
 _RATE_LIMIT_FILE = os.path.join(_DIR, ".voice_rate_limits")
 _TASK_FILE = os.path.join(_DIR, ".voice_task")
+_LAST_DONE_FILE = os.path.join(_DIR, ".voice_task_completed")
 
 _BH = CFG.get("barehands_state_dir") or ""
 _BH_STATE = os.path.join(_BH, "state") if _BH else ""
@@ -111,6 +120,29 @@ _subagent_tasks: dict[str, dict] = {}
 _heartbeat_thread: threading.Thread | None = None
 _HEARTBEAT_INTERVAL = 10.0   # well under ai-visualizer's 30s stale_limit
 
+# The single most recent completion (tool call or background agent),
+# kept after its entry leaves _tasks/_subagent_tasks so a face can show
+# a persistent "last done" row. Deliberately a bare dict, not a list —
+# one real result, replaced by the next one, never an accreting log.
+_last_done: dict | None = None
+
+
+def _write_last_done():
+    if _last_done is None:
+        return
+    try:
+        with open(_LAST_DONE_FILE, "w") as f:
+            json.dump(_last_done, f)
+    except OSError:
+        pass
+
+
+def _record_done(entry: dict):
+    global _last_done
+    _last_done = {"id": entry["id"], "label": entry["label"],
+                  "completed_ts": time.time()}
+    _write_last_done()
+
 
 def _write_tasks():
     try:
@@ -137,8 +169,10 @@ def start_task(task_id: str, label: str, eta: float | None = None):
 
 def end_task(task_id: str):
     """That tool call finished (or failed) — drop it from the active
-    set. Never raises."""
-    _tasks.pop(task_id, None)
+    set and record it as the newest completion. Never raises."""
+    entry = _tasks.pop(task_id, None)
+    if entry is not None:
+        _record_done(entry)
     _write_tasks()
 
 
@@ -186,9 +220,11 @@ def start_subagent_task(agent_id: str, label: str):
 
 
 def end_subagent_task(agent_id: str):
-    """That background agent (SubagentStop) is done — drop it. Never
-    raises."""
-    _subagent_tasks.pop(agent_id, None)
+    """That background agent (SubagentStop) is done — drop it and
+    record it as the newest completion. Never raises."""
+    entry = _subagent_tasks.pop(agent_id, None)
+    if entry is not None:
+        _record_done(entry)
     _write_tasks()
 
 
