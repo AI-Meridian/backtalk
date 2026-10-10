@@ -242,6 +242,30 @@ class WarmBrain:
         # True while a query's response hasn't been consumed through its
         # ResultMessage — i.e. the shared message pipe may hold leftovers.
         self._dirty = False
+        # THE UNSOLICITED-REPLY FIX. A background Agent/Task tool call can
+        # keep running past its own turn's ResultMessage — the SDK
+        # deliberately holds the pipe open for it (see Query._read_messages's
+        # own "inflight_tasks" comment: a result arriving while tasks are
+        # still running does not close stdin). When that task finishes, the
+        # model can produce a genuine FOLLOW-UP turn — more stream events,
+        # another ResultMessage — that nobody asked for. Every consumer
+        # below used to call self._client.receive_response() directly and
+        # only reactively, in response to something the person said or
+        # typed, so that follow-up turn sat in the SDK's own internal
+        # buffer, genuinely unread, until the next REAL utterance happened
+        # to drain it first — speaking yesterday's leftover reply instead
+        # of answering the new question.
+        #
+        # Fix: ONE task (_pump) is now the sole, permanent reader of
+        # receive_messages(); everything else reads from this queue
+        # instead. _inbox_lock says who currently owns that reading —
+        # ask_stream/command/reset_turn while a real turn is in flight,
+        # or next_unsolicited() the instant nobody else does, so a
+        # follow-up turn gets caught and spoken the moment it lands
+        # rather than whenever the next real input happens to flush it.
+        self._inbox: asyncio.Queue = asyncio.Queue()
+        self._inbox_lock = asyncio.Lock()
+        self._pump_task: asyncio.Task | None = None
 
     async def start(self):
         mode = CFG["permission_mode"]
@@ -280,6 +304,7 @@ class WarmBrain:
             try:
                 self._client = ClaudeSDKClient(options=_opts(resume))
                 await self._client.connect()
+                self._start_pump()
                 log(f"[brain] resumed session {resume[:8]}")
                 return
             except Exception as e:
@@ -293,6 +318,32 @@ class WarmBrain:
                     pass
         self._client = ClaudeSDKClient(options=_opts(None))
         await self._client.connect()
+        self._start_pump()
+
+    def _start_pump(self):
+        """Spawn the one task that will own receive_messages() for this
+        client's whole life. Any leftover inbox items belong to a now-dead
+        connection — discarded so a rebuilt session never hands a stale
+        message to the first thing that reads from it."""
+        while not self._inbox.empty():
+            self._inbox.get_nowait()
+        self._pump_task = asyncio.create_task(self._pump())
+
+    async def _pump(self):
+        """THE one and only reader of the SDK's message stream, for the
+        life of this client connection — see the _inbox_lock comment in
+        __init__ for why a second reader is the whole bug this exists to
+        fix. Every message, solicited or not, lands here first."""
+        try:
+            async for message in self._client.receive_messages():
+                await self._inbox.put(message)
+        except Exception as e:
+            # A dead pipe here is not silently lost: whichever consumer
+            # next awaits the inbox will simply sit on an empty queue
+            # until its own _ASK_IDLE_TIMEOUT fires and rebuilds — the
+            # same stall-recovery path that already existed, just fed
+            # from the queue instead of the SDK iterator directly.
+            log(f"[brain] message pump ended: {e!r}")
 
     async def set_permission_mode(self, backtalk_mode: str):
         """Live flip, no reconnect, conversation intact ("ask" maps to
@@ -398,29 +449,34 @@ class WarmBrain:
         here would deafen the whole voice loop. On timeout the pipe is
         left marked dirty so the next reset_turn drains or rebuilds."""
         self._dirty = True
-        await self._client.query(cmd)
-        texts = []
-
-        async def _collect():
-            async for msg in self._client.receive_response():
-                t = type(msg).__name__
-                if t == "AssistantMessage":
-                    for b in getattr(msg, "content", []) or []:
-                        txt = getattr(b, "text", None)
-                        if txt:
-                            texts.append(txt)
-                elif t == "ResultMessage":
-                    self._dirty = False
-                    self._tally(msg, count_turn=False)
-                    self._remember_session(msg)
-                    break
-
+        await self._inbox_lock.acquire()
         try:
-            await asyncio.wait_for(_collect(), 90)
-        except asyncio.TimeoutError:
-            log(f"[brain] console command timed out: {cmd!r}")
-            return "error: the command timed out"
-        return " ".join(texts).strip()
+            await self._client.query(cmd)
+            texts = []
+
+            async def _collect():
+                while True:
+                    msg = await self._inbox.get()
+                    t = type(msg).__name__
+                    if t == "AssistantMessage":
+                        for b in getattr(msg, "content", []) or []:
+                            txt = getattr(b, "text", None)
+                            if txt:
+                                texts.append(txt)
+                    elif t == "ResultMessage":
+                        self._dirty = False
+                        self._tally(msg, count_turn=False)
+                        self._remember_session(msg)
+                        break
+
+            try:
+                await asyncio.wait_for(_collect(), 90)
+            except asyncio.TimeoutError:
+                log(f"[brain] console command timed out: {cmd!r}")
+                return "error: the command timed out"
+            return " ".join(texts).strip()
+        finally:
+            self._inbox_lock.release()
 
     async def interrupt(self):
         if self._client:
@@ -443,43 +499,55 @@ class WarmBrain:
         the last turn was consumed clean."""
         if not self._client or not self._dirty:
             return
+        await self._inbox_lock.acquire()
         try:
-            await asyncio.wait_for(self._client.interrupt(), 5)
-        except Exception:
-            pass  # turn may already be over — the drain below is the point
+            try:
+                await asyncio.wait_for(self._client.interrupt(), 5)
+            except Exception:
+                pass  # turn may already be over — the drain below is the point
 
-        async def _drain() -> int:
-            n = 0
-            async for msg in self._client.receive_response():
-                n += 1
-                if type(msg).__name__ == "ResultMessage":
-                    break
-            return n
+            async def _drain() -> int:
+                n = 0
+                while True:
+                    msg = await self._inbox.get()
+                    n += 1
+                    if type(msg).__name__ == "ResultMessage":
+                        break
+                return n
 
-        try:
-            drained = await asyncio.wait_for(_drain(), timeout)
-            if drained == 0:
-                # A genuinely resynced pipe always yields at least the
-                # dead turn's leftover ResultMessage (per the docstring
-                # above). Zero means there was nothing left to find
-                # because the subprocess connection itself is gone, not
-                # that the pipe happened to already be aligned — every
-                # healthy interrupt in the field logs drains 2+ messages,
-                # never 0. Fall through to the same rebuild as a timeout.
-                raise RuntimeError("drain returned zero messages — "
-                                    "pipe is dead, not just desynced")
-            log(f"[brain] interrupted turn drained ({drained} stale messages)")
-            self._dirty = False
-        except Exception:
-            # Can't re-align — rebuild the session rather than run
-            # desynced. Loses this voice session's conversation memory;
-            # better than answering every question one turn late for the
-            # rest of the day.
-            log("[brain] stream desynced beyond repair — rebuilding the "
-                "session (conversation memory for this session resets)")
-            await self._rebuild_session()
+            try:
+                drained = await asyncio.wait_for(_drain(), timeout)
+                if drained == 0:
+                    # A genuinely resynced pipe always yields at least the
+                    # dead turn's leftover ResultMessage (per the docstring
+                    # above). Zero means there was nothing left to find
+                    # because the subprocess connection itself is gone, not
+                    # that the pipe happened to already be aligned — every
+                    # healthy interrupt in the field logs drains 2+ messages,
+                    # never 0. Fall through to the same rebuild as a timeout.
+                    raise RuntimeError("drain returned zero messages — "
+                                        "pipe is dead, not just desynced")
+                log(f"[brain] interrupted turn drained ({drained} stale messages)")
+                self._dirty = False
+            except Exception:
+                # Can't re-align — rebuild the session rather than run
+                # desynced. Loses this voice session's conversation memory;
+                # better than answering every question one turn late for the
+                # rest of the day.
+                log("[brain] stream desynced beyond repair — rebuilding the "
+                    "session (conversation memory for this session resets)")
+                await self._rebuild_session()
+        finally:
+            self._inbox_lock.release()
 
     async def stop(self):
+        if self._pump_task:
+            self._pump_task.cancel()
+            try:
+                await self._pump_task
+            except Exception:
+                pass
+            self._pump_task = None
         if self._client:
             await self._client.disconnect()
             self._client = None
@@ -488,6 +556,13 @@ class WarmBrain:
         """Disconnect and reconnect fresh. Loses this voice session's
         conversation memory; called only once the pipe to the CLI
         subprocess is confirmed dead, never for a routine resync."""
+        if self._pump_task:
+            self._pump_task.cancel()
+            try:
+                await self._pump_task
+            except Exception:
+                pass
+            self._pump_task = None
         try:
             await self._client.disconnect()
         except Exception:
@@ -497,29 +572,66 @@ class WarmBrain:
         self._dirty = False
 
     async def ask_stream(self, utterance: str):
-        """Yield complete sentences as they stream out of the model.
+        """Yield complete sentences as they stream out of the model, for
+        a turn WE initiated. Claims _inbox_lock for the duration — see
+        the lock's own comment in __init__ — then shares the actual
+        pulling/sentence-splitting with next_unsolicited() via
+        _pump_sentences()."""
+        self._dirty = True             # in flight until its ResultMessage
+        await self._inbox_lock.acquire()
+        try:
+            await self._client.query(utterance)
+            async for sentence in self._pump_sentences():
+                yield sentence
+        finally:
+            self._inbox_lock.release()
+
+    def unsolicited_pending(self) -> bool:
+        """True once a follow-up turn nobody asked for (see the
+        _inbox_lock comment in __init__) has genuinely started arriving,
+        with nothing else currently reading. Checked by the main loop
+        before it ever calls next_unsolicited(), so a real ask_stream or
+        command already in flight is never double-consumed — the lock
+        being held is exactly what "already in flight" means here."""
+        return not self._inbox_lock.locked() and not self._inbox.empty()
+
+    async def next_unsolicited(self):
+        """Yield complete sentences for a follow-up turn nobody asked
+        for. Claims _inbox_lock the instant nothing else owns it (see
+        __init__), then streams identically to ask_stream — same
+        sentence-splitting, same stall/rebuild recovery, same task-panel
+        hooks — via the shared _pump_sentences()."""
+        await self._inbox_lock.acquire()
+        try:
+            self._dirty = True
+            async for sentence in self._pump_sentences():
+                yield sentence
+        finally:
+            self._inbox_lock.release()
+
+    async def _pump_sentences(self):
+        """Shared by ask_stream and next_unsolicited: pull parsed
+        messages from the one shared inbox (fed by _pump), extract
+        complete sentences the instant they're ready, stop at the
+        turn's ResultMessage. Caller must hold _inbox_lock for the
+        whole call.
 
         Bounded by _ASK_IDLE_TIMEOUT per message, not per turn: a slow
         but ALIVE tool call (a big image review, a web fetch) can go
-        quiet for a while and that's fine, but a subprocess that never
-        produces another message again is a dead pipe, and this used to
-        have no bound at all — a stalled turn just hung the voice line
+        quiet for a while and that's fine, but a pipe that never
+        produces another message again is dead, and this used to have
+        no bound at all — a stalled turn just hung the voice line
         forever with no recovery short of killing the process."""
-        self._dirty = True             # in flight until its ResultMessage
-        await self._client.query(utterance)
         buf = ""
         writing_blocks: set[int] = set()   # text content-block indices
-        stream = self._client.receive_response()
         try:
             while True:
                 try:
-                    msg = await asyncio.wait_for(stream.__anext__(),
+                    msg = await asyncio.wait_for(self._inbox.get(),
                                                   _ASK_IDLE_TIMEOUT)
-                except StopAsyncIteration:
-                    break
                 except asyncio.TimeoutError:
-                    log(f"[brain] ask_stream stalled ({_ASK_IDLE_TIMEOUT}s "
-                        "with no stream activity) — rebuilding the session")
+                    log(f"[brain] stream stalled ({_ASK_IDLE_TIMEOUT}s "
+                        "with no activity) — rebuilding the session")
                     await self._rebuild_session()
                     yield ("Sorry, I lost the connection mid-turn there. "
                            "I've reconnected — go ahead and ask again.")

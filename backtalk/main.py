@@ -629,10 +629,25 @@ def _typed_reader(q: "queue.Queue[str]"):
                 sys.stdout.flush()
 
 
-async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
+async def _wait_unsolicited(brain: WarmBrain):
+    """Polls for a follow-up turn nobody asked for (see WarmBrain's
+    _inbox_lock comment) so the main loop can speak it the moment it
+    actually lands, not whenever the next real utterance happens to
+    flush the pipe. 0.2s is plenty for traffic this rare — a background
+    agent finishing is not a hot path."""
+    while not brain.unsolicited_pending():
+        await asyncio.sleep(0.2)
+
+
+async def speak_reply(stream, mouth: Mouth, brain: WarmBrain):
     """First sentence ships alone (fast start); the rest go in
     2-sentence breaths — fuller chunks get livelier prosody (single
-    short sentences come out flat)."""
+    short sentences come out flat). `stream` is whatever async sentence
+    generator owns this turn — brain.ask_stream(text) for a reply to
+    something the person said, brain.next_unsolicited() for a follow-up
+    turn nobody asked for (a background agent finishing after its own
+    turn's result already came back — see WarmBrain's _inbox_lock
+    comment) — spoken through the exact same pipeline either way."""
     t0 = time.time()
     first = True
     batch: list[str] = []
@@ -670,7 +685,7 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
                 batch = []
 
     try:
-        async for sentence in brain.ask_stream(text):
+        async for sentence in stream:
             emit(sentence)
         if batch:
             mouth.say_chunk(" ".join(batch), pending)
@@ -983,7 +998,8 @@ async def amain():
         # wait on a ResultMessage the CLI is withholding for an answer.
         _deny_pending()
         await brain.reset_turn()
-        speak_task = asyncio.create_task(speak_reply(brain, mouth, text))
+        speak_task = asyncio.create_task(
+            speak_reply(brain.ask_stream(text), mouth, brain))
         return True
 
     try:
@@ -997,6 +1013,12 @@ async def amain():
         ptt = PTTListener(CFG["ptt_key"])
         press_fut: asyncio.Future | None = None
         mic_fut: asyncio.Future | None = None
+        # Watches for a follow-up turn nobody asked for (see
+        # _wait_unsolicited's own docstring) so it gets spoken the
+        # instant it lands, through the exact same dispatch point as a
+        # key press or typed line — never a separate task racing to
+        # assign speak_task on its own.
+        unsolicited_fut: asyncio.Future | None = None
         mic_gen_seen = _MIC["gen"]
         # The open mic yields while the BUTTON records (or the double
         # capture would turn one held utterance into two turns), and,
@@ -1017,7 +1039,13 @@ async def amain():
                 typed_fut = loop.run_in_executor(None, typed_q.get)
             if press_fut is None:
                 press_fut = loop.run_in_executor(None, ptt.wait_press)
+            if (unsolicited_fut is None
+                    and not (speak_task and not speak_task.done())):
+                unsolicited_fut = asyncio.ensure_future(
+                    _wait_unsolicited(brain))
             waiters = {press_fut, typed_fut}
+            if unsolicited_fut is not None:
+                waiters.add(unsolicited_fut)
             if _MIC["mode"] == "open":
                 if mic_fut is None:
                     g = _MIC["gen"]
@@ -1032,6 +1060,15 @@ async def amain():
                 text = typed_fut.result(); typed_fut = None
                 if text and not await handle(text):
                     return
+                continue
+            if unsolicited_fut is not None and unsolicited_fut in done:
+                unsolicited_fut.result(); unsolicited_fut = None
+                if not (speak_task and not speak_task.done()):
+                    log("[turn] unsolicited reply detected — speaking it")
+                    signals.set_state("thinking")
+                    signals.static_start()
+                    speak_task = asyncio.create_task(
+                        speak_reply(brain.next_unsolicited(), mouth, brain))
                 continue
             if mic_fut is not None and mic_fut in done:
                 try:
@@ -1103,6 +1140,8 @@ async def amain():
         pass
     finally:
         _MIC["gen"] += 1     # abort any live open-mic capture promptly
+        if unsolicited_fut is not None and not unsolicited_fut.done():
+            unsolicited_fut.cancel()
         if speak_task and not speak_task.done():
             speak_task.cancel()
         mouth.shutdown()  # restores the music on Ctrl-C / crash paths too
