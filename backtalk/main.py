@@ -1039,8 +1039,17 @@ async def amain():
                 typed_fut = loop.run_in_executor(None, typed_q.get)
             if press_fut is None:
                 press_fut = loop.run_in_executor(None, ptt.wait_press)
-            if (unsolicited_fut is None
-                    and not (speak_task and not speak_task.done())):
+            # Armed unconditionally, even while speak_task is busy: the
+            # loop only wakes up when something in `waiters` resolves, so
+            # if this were gated on speak_task being idle, a reply that
+            # finishes silently (e.g. the current speak_task yields zero
+            # sentences) would leave nothing to notice unsolicited_pending()
+            # going true until the user's next utterance happens to kick
+            # the loop — the exact bug where a ready reply sits mute until
+            # re-prompted. unsolicited_pending() already returns False
+            # while the inbox lock is held, so this is a no-op race against
+            # a live ask_stream, never a double-consume.
+            if unsolicited_fut is None:
                 unsolicited_fut = asyncio.ensure_future(
                     _wait_unsolicited(brain))
             waiters = {press_fut, typed_fut}
