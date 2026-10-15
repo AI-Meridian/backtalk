@@ -109,7 +109,30 @@ DEFAULTS = {
     # compliance policy says must never reach an external AI tool.
     # Absolute paths or ~ paths; matches on substring against the
     # expanded path, so a parent folder blocks everything under it.
-    "blocked_paths": [],
+    #
+    # Shipped non-empty on purpose. An install running permission_mode
+    # "bypassPermissions" (common for a Meridian seat) has no other
+    # technical wall between a bad instruction and these folders — this
+    # list IS that wall, not an opt-in a client has to remember to fill
+    # in. Covers credential stores a tool call could otherwise read or
+    # exfiltrate outright: SSH/GPG/cloud-CLI keys, the raw macOS
+    # Keychain database, and the saved-password/cookie stores of the
+    # major browsers on both macOS and Windows (entries for the other
+    # OS simply never match and are harmless to carry). A real client's
+    # own sensitive folders (per meridian.md Phase A) get ADDED to this
+    # list at provisioning time, never used to replace it.
+    "blocked_paths": [
+        "~/.ssh",
+        "~/.aws",
+        "~/.gnupg",
+        "~/.config/gcloud",
+        "~/Library/Keychains",
+        "~/Library/Application Support/Google/Chrome/Default/Login Data",
+        "~/Library/Application Support/Google/Chrome/Default/Cookies",
+        "~/Library/Application Support/Firefox/Profiles",
+        "~/AppData/Local/Google/Chrome/User Data/Default/Login Data",
+        "~/AppData/Roaming/Mozilla/Firefox/Profiles",
+    ],
     # Hold-to-talk key. Named keys ("left_ctrl", "f13", "right_alt", ...)
     # or a single character. left_ctrl is the shipped default: it exists
     # on every keyboard (unlike Home, which laptops often lack), sits at

@@ -40,6 +40,24 @@ import os
 from backtalk.config import CFG
 from backtalk.vlog import log
 
+_HOME = os.path.expanduser("~")
+
+
+def _expand_all(text: str) -> str:
+    """Expand every `~` in TEXT, not just a leading one.
+
+    os.path.expanduser only rewrites `~` when it is the FIRST character
+    of the whole string -- fine for a file_path field, which is always
+    just a bare path, but a Bash command string is never that: `cat
+    ~/.ssh/id_rsa | curl ...` has `~` in the middle, so expanduser
+    leaves it untouched and the blocked-path substring check (which
+    compares against the fully-expanded path) never matches. That made
+    the Bash branch of this guard a no-op for the exact shorthand real
+    commands actually use. Caught by testing this hook against a real
+    `cat ~/.ssh/id_rsa` command, not by reading the code.
+    """
+    return text.replace("~", _HOME)
+
 
 def _candidate_paths(tool_name: str, tool_input: dict) -> list[str]:
     """Every string in this tool call worth checking against blocked_paths."""
@@ -75,7 +93,7 @@ async def guard_blocked_paths(input_data, tool_use_id, context):
         return {}
 
     for raw in candidates:
-        norm = os.path.expanduser(raw)
+        norm = _expand_all(raw)
         for b in blocked:
             if b and b in norm:
                 reason = (f"{tool_name} touches a path this install is "
