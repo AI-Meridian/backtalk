@@ -26,5 +26,3 @@ show.json
 .python-version
 # Config backups the setup wizard leaves behind.
 *.json.*.bak
-.voice_last_reply
-.voice_alert
