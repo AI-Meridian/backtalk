@@ -42,6 +42,18 @@ is the whole integration surface:
                       by the next completion, never cleared — once
                       something has finished this run, this file always
                       names the newest one to finish.
+  .voice_last_reply   JSON {ts, text, turn} — what the agent has SAID
+                      so far in its current reply, grown one chunk at a
+                      time at the moment each chunk's audio starts (the
+                      same instant stage directions fire), so a face
+                      can show the words on the spoken word rather than
+                      seconds ahead of it. A new turn starts the text
+                      fresh; the previous reply stays on screen until
+                      the new one actually begins speaking.
+  .voice_alert        non-empty = attention needed. Written by the voice
+                      line when Claude Code turns out to be signed out
+                      (faces go amber/red), cleared once a turn succeeds
+                      again. Nothing else here writes it.
 
 Written to signals_dir (default: the repo root). Visualizers built on
 this contract just work.
@@ -74,6 +86,8 @@ _REPLY_DONE_FILE = os.path.join(_DIR, ".voice_reply_done")
 _RATE_LIMIT_FILE = os.path.join(_DIR, ".voice_rate_limits")
 _TASK_FILE = os.path.join(_DIR, ".voice_task")
 _LAST_DONE_FILE = os.path.join(_DIR, ".voice_task_completed")
+_LAST_REPLY_FILE = os.path.join(_DIR, ".voice_last_reply")
+_ALERT_FILE = os.path.join(_DIR, ".voice_alert")
 
 _BH = CFG.get("barehands_state_dir") or ""
 _BH_STATE = os.path.join(_BH, "state") if _BH else ""
@@ -250,6 +264,61 @@ def end_subagent_task(agent_id: str):
     if entry is not None:
         _record_done(entry)
     _write_tasks()
+
+
+# The reply being spoken right now, for the floating reply panel. One
+# dict, replaced turn by turn — never a transcript. `turn` lets a face
+# tell "same reply, more words" from "a new reply started" without
+# diffing text.
+_reply = {"turn": 0, "text": ""}
+
+
+def _write_last_reply():
+    try:
+        with open(_LAST_REPLY_FILE, "w") as f:
+            json.dump({"ts": time.time(), "turn": _reply["turn"],
+                       "text": _reply["text"]}, f)
+    except OSError:
+        pass
+
+
+def reply_new():
+    """A new reply is about to be spoken (a new turn of the person's, a
+    console verb, a follow-up nobody asked for). Resets the text but
+    does NOT write: the previous reply stays on screen until the new
+    one's first chunk actually starts playing. Never raises."""
+    _reply["turn"] += 1
+    _reply["text"] = ""
+
+
+def reply_chunk_started(text: str):
+    """One chunk of the current reply has just become audible — append
+    it and publish. Called by the mouth at the exact moment the first
+    audio block is written, never at synthesis time. Never raises."""
+    text = " ".join(str(text or "").split())
+    if not text:
+        return
+    _reply["text"] = (_reply["text"] + " " + text).strip()
+    _write_last_reply()
+
+
+def _write_alert(on: bool):
+    try:
+        if on:
+            with open(_ALERT_FILE, "w") as f:
+                f.write("1")
+        else:
+            os.remove(_ALERT_FILE)
+    except OSError:
+        pass
+
+
+def set_alert(on: bool):
+    """Raise or clear the attention signal every face already knows how
+    to show (non-empty .voice_alert = alert). Used for "Claude Code is
+    signed out" — a fault the face must show even when the voice line
+    has nothing to say. Never raises."""
+    _write_alert(bool(on))
 
 
 def feed_waveform(pcm: np.ndarray):

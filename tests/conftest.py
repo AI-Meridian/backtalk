@@ -11,11 +11,35 @@ import pytest
 
 from backtalk import signals
 
+# The genuine file writers, captured BEFORE the autouse fixtures below
+# replace them, so a test that wants to exercise the real write path
+# against a temp file can put the original back for itself.
+REAL_WRITERS = {"last_reply": signals._write_last_reply,
+                "alert": signals._write_alert}
+
+
+@pytest.fixture
+def real_writers():
+    return REAL_WRITERS
+
 
 @pytest.fixture(autouse=True)
 def isolate_signal_files(monkeypatch):
     monkeypatch.setattr(signals, "_write_tasks", lambda: None)
     monkeypatch.setattr(signals, "_write_last_done", lambda: None)
+    monkeypatch.setattr(signals, "_write_last_reply", lambda: None)
+    # .voice_alert is read by a live face the moment it exists; a test
+    # must never raise a real alert on Hugo's actual screen.
+    monkeypatch.setattr(signals, "_write_alert", lambda on: None)
+
+
+@pytest.fixture(autouse=True)
+def reset_reply_state():
+    signals._reply["turn"] = 0
+    signals._reply["text"] = ""
+    yield
+    signals._reply["turn"] = 0
+    signals._reply["text"] = ""
 
 
 @pytest.fixture(autouse=True)

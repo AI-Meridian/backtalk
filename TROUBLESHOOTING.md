@@ -61,7 +61,11 @@ hold key -> ears.record_held (sounddevice, 16kHz int16)
                               cwd = agent_dir, streams sentences)
          -> mouth.say_chunk (kokoro in-process -> one long-lived
                              OutputStream; ElevenLabs optional)
-signals.py mirrors state to .voice_* files (+ optional barehands state/)
+signals.py mirrors state to .voice_* files (+ optional barehands state/):
+         state, waveform, tasks, last-done, last_reply (what's being
+         said, published as each chunk's audio starts), alert
+auth.py  the signed-out preflight (claude auth status --json) and the
+         error classifier brain.py speaks error results through
 permission_mode "ask": gated tools pause the turn and route to a spoken
                        yes/no (main.make_permission_gate). The LIVE
                        auto-approve switch is a gate flag; a session

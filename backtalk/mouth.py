@@ -574,8 +574,10 @@ class Mouth:
             # is next. Publishing now is what puts a screen cue on the spoken
             # word rather than seconds ahead of it.
             if directions:
-                from backtalk import signals as _sig
-                _sig.direction(directions)
+                signals.direction(directions)
+            # Same instant, same reason: the reply panel shows this text
+            # as it is heard, not when the model produced it.
+            signals.reply_chunk_started(sentence)
 
             def _write(pcm):
                 for i in range(0, len(pcm), block):

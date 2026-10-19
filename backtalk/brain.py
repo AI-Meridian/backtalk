@@ -42,12 +42,22 @@ try:
 except ImportError:                       # older SDKs: nothing to silence
     CanUseToolShadowedWarning = None
 
-from backtalk import signals
+from backtalk import auth, signals
 from backtalk.config import CFG, DISCIPLINE
 from backtalk.path_guard import guard_blocked_paths
 from backtalk.vlog import log
 
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s")
+_URL_RE = re.compile(r"https?://\S+")
+
+
+def _speakable_error(text: str) -> str:
+    """An error string from the CLI, made fit for the ear: no URLs, no
+    middle dots, no slash-commands read out as punctuation."""
+    s = _URL_RE.sub("", str(text or ""))
+    s = s.replace("\u00b7", ", ").replace("`", "")
+    s = s.replace("/login", "the login command")
+    return " ".join(s.split())[:220]
 
 # Plain-English labels for a face to show while a tool runs and the
 # brain has gone quiet. Unlisted tools (custom MCP tools, future
@@ -266,6 +276,17 @@ class WarmBrain:
         self._inbox: asyncio.Queue = asyncio.Queue()
         self._inbox_lock = asyncio.Lock()
         self._pump_task: asyncio.Task | None = None
+        # THE SIGNED-OUT FIX. A turn's ResultMessage can carry is_error
+        # with zero sentences before it — "Not logged in · Please run
+        # /login" is the field case (2026-10-19) — and every consumer
+        # used to treat that as a turn that simply ended, so the voice
+        # line went quiet and the boot even logged "brain warm" on a
+        # session that could never answer. Now: the error is spoken, an
+        # auth-shaped one raises the face's alert and sets auth_failed
+        # so main.py can wait for the sign-in and rebuild the session.
+        self.last_error: str | None = None
+        self.auth_failed = False
+        self._alert_raised = False
 
     async def start(self):
         mode = CFG["permission_mode"]
@@ -570,6 +591,40 @@ class WarmBrain:
         self._client = None
         await self.start()
         self._dirty = False
+        self.auth_failed = False
+
+    def _result_error_line(self, msg) -> str | None:
+        """None for a clean result. For an error result: the sentence to
+        SPEAK about it, with the signed-out case recognised by the same
+        wording the CLI uses, the face's alert raised, and auth_failed
+        set for main.py. A clean result after a raised alert clears it
+        (only one this brain raised — never someone else's .voice_alert)."""
+        subtype = str(getattr(msg, "subtype", "") or "")
+        is_err = bool(getattr(msg, "is_error", False)) \
+            or subtype.startswith("error")
+        if not is_err:
+            self.last_error = None
+            if self._alert_raised:
+                signals.set_alert(False)
+                self._alert_raised = False
+            return None
+        text = " ".join(str(getattr(msg, "result", "") or "").split())
+        if not text:
+            errs = getattr(msg, "errors", None) or []
+            text = " ".join(str(e) for e in errs)
+        self.last_error = text or subtype or "error"
+        log(f"[brain] turn ended in an error result ({subtype}): "
+            f"{self.last_error[:200]}")
+        if auth.is_auth_error(text):
+            self.auth_failed = True
+            if not self._alert_raised:
+                signals.set_alert(True)
+                self._alert_raised = True
+            return auth.SPOKEN_SIGNED_OUT
+        clean = _speakable_error(text)
+        return (f"My Claude session returned an error. {clean}" if clean
+                else "My Claude session returned an error with no detail. "
+                     "Check the log.")
 
     async def ask_stream(self, utterance: str):
         """Yield complete sentences as they stream out of the model, for
@@ -682,6 +737,9 @@ class WarmBrain:
                     self._dirty = False    # turn fully consumed — pipe aligned
                     self._tally(msg)
                     self._remember_session(msg)
+                    spoken = self._result_error_line(msg)
+                    if spoken:
+                        yield spoken
                     await self._pull_rate_limits()
                     break
             tail = buf.strip()

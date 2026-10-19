@@ -61,7 +61,7 @@ import sys
 import threading
 import time
 
-from backtalk import signals
+from backtalk import auth, signals
 from backtalk.brain import WarmBrain
 from backtalk.config import CFG
 from backtalk.ears import (Ears, explain_audio_failure, record_held,
@@ -703,6 +703,38 @@ async def speak_reply(stream, mouth: Mouth, brain: WarmBrain):
         raise
 
 
+async def _auth_gate(mouth, loop):
+    """Block until Claude Code on this machine is signed in. Returns at
+    once in the normal case (one ~0.3s subprocess). Signed out: raise
+    the face's alert, say so ONCE in plain words, then poll every five
+    seconds — the face's SIGN IN button (or `claude auth login` in any
+    terminal) is the fix, and this picks it up the moment it lands.
+    A nag every two minutes, no more: silence between is deliberate."""
+    st = await loop.run_in_executor(None, auth.status)
+    if st["cli_found"] and st["logged_in"]:
+        return st
+    log(f"[auth] not ready: {st.get('error') or 'signed out'} — waiting")
+    signals.set_alert(True)
+    signals.reply_new()
+    mouth.say(auth.SPOKEN_NO_CLI if not st["cli_found"]
+              else auth.SPOKEN_SIGNED_OUT)
+    last_nag = time.monotonic()
+    while True:
+        await asyncio.sleep(5)
+        st = await loop.run_in_executor(None, auth.status)
+        if st["cli_found"] and st["logged_in"]:
+            break
+        if time.monotonic() - last_nag > 120:
+            last_nag = time.monotonic()
+            mouth.say(auth.SPOKEN_STILL_WAITING)
+    signals.set_alert(False)
+    log(f"[auth] signed in ({st.get('method') or 'claude.ai'}"
+        f"{', ' + st['plan'] if st.get('plan') else ''})")
+    signals.reply_new()
+    mouth.say(auth.SPOKEN_SIGNED_IN)
+    return st
+
+
 async def amain():
     open_mic = "--open-mic" in sys.argv
     barge_in = "--barge-in" in sys.argv
@@ -739,9 +771,14 @@ async def amain():
     log(f"[backtalk] up — agent={NAME} dir={CFG['agent_dir']} "
         f"model={brain.model} mic={mode} "
         f"(say 'goodbye {NAME.lower()}' to hang up)")
+    loop = asyncio.get_event_loop()
+    # SIGNED IN? Asked BEFORE the greeting, so the first words out are
+    # the truth. The normal case costs one short subprocess; signed out,
+    # this waits (and says so) until the sign-in lands.
+    await _auth_gate(mouth, loop)
+    signals.reply_new()
     mouth.say(CFG["greeting"])
 
-    loop = asyncio.get_event_loop()
     # Warm the engines while the greeting plays: the STT model load and
     # the brain's prompt-cache toll both hide behind the spoken line.
     loop.run_in_executor(None, warm_ears)
@@ -752,23 +789,53 @@ async def amain():
     # case: the greeting played, then nothing, and on Windows the
     # window closed before anyone could read the error).
     log("[backtalk] connecting the brain...")
+
+    async def _warmup():
+        got = []
+        async for s in brain.ask_stream(
+                "Warmup ping - reply with the single word: ready"):
+            got.append(s)
+        return got
+
     try:
         await asyncio.wait_for(brain.start(), 120)
-
-        async def _warmup():
-            async for _ in brain.ask_stream(
-                    "Warmup ping - reply with the single word: ready"):
-                pass
-        await asyncio.wait_for(_warmup(), 180)
+        # A warmup that comes back as an ERROR RESULT is not warm, and
+        # it used to be counted as warm: zero sentences, stream ended,
+        # "brain warm" in the log, then silence all session. Now an
+        # auth-shaped error waits for the sign-in and rebuilds; any
+        # other error is spoken, with its real text, and the boot stops.
+        for attempt in range(3):
+            await asyncio.wait_for(_warmup(), 180)
+            if not brain.last_error:
+                break
+            if brain.auth_failed:
+                log("[backtalk] warmup came back signed out")
+                signals.reply_new()
+                mouth.say(auth.SPOKEN_SIGNED_OUT)
+                while True:
+                    await asyncio.sleep(5)
+                    st = await loop.run_in_executor(None, auth.status)
+                    if st["cli_found"] and st["logged_in"]:
+                        break
+                signals.reply_new()
+                mouth.say(auth.SPOKEN_SIGNED_IN)
+                await brain._rebuild_session()
+                continue
+            raise RuntimeError(brain.last_error)
+        else:
+            raise RuntimeError(brain.last_error or "warmup never succeeded")
     except (Exception, asyncio.TimeoutError) as e:
         kind = ("timed out" if isinstance(e, asyncio.TimeoutError)
                 else f"failed: {e!r}"[:220])
         log(f"[backtalk] BRAIN CONNECT {kind}")
+        detail = brain.last_error
+        signals.reply_new()
         mouth.say("Bad news. The voice and the face are fine, but I "
                   "couldn't reach my brain, the Claude Code session. "
-                  "Check this window for the error. The usual causes: "
-                  "Claude Code isn't signed in, the internet is down, "
-                  "or the plan is out of usage.")
+                  + (f"The error was: {detail[:200]}. " if detail else
+                     "Check this window for the error. ")
+                  + "The usual causes: the internet is down, or the "
+                    "plan is out of usage.")
         mouth.wait_done(timeout=30)
         raise SystemExit(1)
     log("[backtalk] brain warm")
@@ -986,6 +1053,8 @@ async def amain():
             except Exception:
                 pass
             speak_task = None
+        # whatever gets said next is a NEW reply on the face's panel
+        signals.reply_new()
         verb = verb or console_match(text)
         if verb:
             await run_console(verb)
@@ -998,6 +1067,14 @@ async def amain():
         # wait on a ResultMessage the CLI is withholding for an answer.
         _deny_pending()
         await brain.reset_turn()
+        if brain.auth_failed:
+            # The last turn died signed-out. If the sign-in has landed
+            # since, rebuild so the session actually carries the new
+            # credentials rather than hoping the old subprocess noticed.
+            st = await loop.run_in_executor(None, auth.status)
+            if st["cli_found"] and st["logged_in"]:
+                log("[auth] signed back in — rebuilding the session")
+                await brain._rebuild_session()
         speak_task = asyncio.create_task(
             speak_reply(brain.ask_stream(text), mouth, brain))
         return True
@@ -1074,6 +1151,7 @@ async def amain():
                 unsolicited_fut.result(); unsolicited_fut = None
                 if not (speak_task and not speak_task.done()):
                     log("[turn] unsolicited reply detected — speaking it")
+                    signals.reply_new()
                     signals.set_state("thinking")
                     signals.static_start()
                     speak_task = asyncio.create_task(
