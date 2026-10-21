@@ -53,7 +53,9 @@ Flags:
 Say "goodbye <name>" / "end voice mode" to hang up. Ctrl-C works.
 """
 import asyncio
+import glob
 import json
+import os
 import queue
 import re
 import socket
@@ -362,6 +364,9 @@ CONSOLE_VERBS = {
                   "are you there", "you still there",
                   "how's it going", "hows it going",
                   "what's happening", "whats happening"),
+    "recap":     ("where were we", "where did we leave off",
+                  "catch me up", "recall our last session",
+                  "what's the recap", "whats the recap"),
     "micopen":   ("go hands free", "hands free mode",
                   "hands free listening", "open mic", "open the mic"),
     "micptt":    ("push to talk", "push to talk mode",
@@ -480,6 +485,80 @@ def _spoken_status(snap):
         return (f"All done. Last thing I finished was {last_done['label']}, "
                 f"about {_fmt_elapsed(last_done['elapsed'])} ago.")
     return "Nothing running right now."
+
+
+_WIKILINK_RE = re.compile(r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]")
+_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+
+
+def _speakable(text):
+    """Strip the vault's own markdown (wikilinks, bold) down to plain
+    words a TTS voice can read cleanly."""
+    text = _WIKILINK_RE.sub(lambda m: m.group(2) or m.group(1), text)
+    return _BOLD_RE.sub(r"\1", text)
+
+
+def _first_sentence(text, max_len=100):
+    """Active Priorities items run from a short "title — detail" line
+    to a full paragraph with no consistent separator — prefer the
+    natural em-dash split, then fall back to the first sentence, then a
+    clean word boundary, so the spoken recap stays a quick list of
+    titles, not a wall of text."""
+    text = text.strip()
+    head = text.split(" — ", 1)[0].strip()
+    if len(head) <= max_len:
+        return head
+    m = re.search(r"\.(\s|$)", head)
+    if m and m.start() <= max_len:
+        return head[:m.start() + 1]
+    return head[:max_len].rsplit(" ", 1)[0]
+
+
+def _vault_dir():
+    dirs = CFG.get("extra_dirs") or []
+    return os.path.expanduser(dirs[0]) if dirs else None
+
+
+def _latest_daily_note(vault_dir):
+    """The most recent daily note by its own YYYY-MM-DD filename, not
+    mtime — an old note edited today must not look like the newest
+    session."""
+    pattern = os.path.join(vault_dir, "01 - Daily Notes", "*", "*.md")
+    dated = [p for p in glob.glob(pattern)
+             if re.match(r"\d{4}-\d{2}-\d{2}\.md$", os.path.basename(p))]
+    return max(dated, key=os.path.basename) if dated else None
+
+
+def _spoken_recap(vault_dir):
+    """Answer "where were we?" straight from the vault's own index
+    bullets and open tasks — a template, not a model summary, so this
+    stays a zero-token console verb like every other Tier 0 command."""
+    if not vault_dir or not os.path.isdir(vault_dir):
+        return "I can't find the vault to recap from."
+    parts = []
+    note_path = _latest_daily_note(vault_dir)
+    if note_path:
+        try:
+            text = open(note_path).read()
+            m = re.search(r"## Index\n(.*?)\n##", text, re.S)
+            bullets = re.findall(r"^- (.+)$", m.group(1), re.M) if m else []
+            if bullets:
+                lead = _speakable(bullets[0].split(" — ")[0]).strip(" *")
+                parts.append(f"Last session: {lead}.")
+        except OSError:
+            pass
+    ap_path = os.path.join(vault_dir, "Active Priorities.md")
+    try:
+        text = open(ap_path).read()
+        m = re.search(r"### Open Tasks\n(.*?)\n### ", text, re.S)
+        items = re.findall(r"^- \[ \] (.+)$", m.group(1), re.M) if m else []
+        if items:
+            tops = [_first_sentence(_speakable(i)).strip(" *")
+                   for i in items[:3]]
+            parts.append("Top open items: " + "; ".join(tops) + ".")
+    except OSError:
+        pass
+    return " ".join(parts) if parts else "Nothing recent to recap."
 
 _PASTE_ON = "\x1b[200~"    # bracketed-paste markers (we enable the mode below)
 _PASTE_OFF = "\x1b[201~"
@@ -936,6 +1015,9 @@ async def amain():
         elif verb == "status":
             resp = ""
             mouth.say(_spoken_status(signals.status_snapshot()))
+        elif verb == "recap":
+            resp = ""
+            mouth.say(_spoken_recap(_vault_dir()))
         elif verb == "micopen":
             resp = ""
             if _MIC["mode"] == "open":
