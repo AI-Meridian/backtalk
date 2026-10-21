@@ -287,6 +287,11 @@ class WarmBrain:
         self.last_error: str | None = None
         self.auth_failed = False
         self._alert_raised = False
+        # One spoken heads-up per window, not a nag every turn: keyed by
+        # the window's own resets_at so a new window (a different
+        # resets_at) clears the warning and can fire again next time
+        # utilization crosses 90%.
+        self._usage_warned_reset_at: dict[str, int] = {}
 
     async def start(self):
         mode = CFG["permission_mode"]
@@ -434,9 +439,17 @@ class WarmBrain:
         wrong, and the containment is the point. Every failure is
         swallowed and the readout simply goes quiet. It must never cost
         a turn, so it is also bounded -- an unanswered control request
-        would otherwise hang the voice line mid-conversation."""
+        would otherwise hang the voice line mid-conversation.
+
+        Also returns a one-time SPOKEN warning the instant a window
+        crosses 90% used, instead of the old behavior of staying silent
+        all the way to the limit and then going dark. Keyed off the
+        window's own resets_at, not a boolean, so a new window (a
+        different resets_at after the old one passes) can warn again —
+        a boolean alone would warn once ever and never re-arm."""
         if not CFG.get("show_usage"):
-            return
+            return None
+        warning = None
         try:
             usage = await asyncio.wait_for(
                 self._client._query._send_control_request(
@@ -457,8 +470,17 @@ class WarmBrain:
                 if isinstance(resets, str):
                     resets = int(datetime.fromisoformat(resets).timestamp())
                 signals.set_rate_limit(window, pct, resets)
+                if pct is not None and pct >= 0.9 and resets is not None \
+                        and self._usage_warned_reset_at.get(window) != resets:
+                    self._usage_warned_reset_at[window] = resets
+                    label = ("five-hour" if window == "five_hour"
+                             else "weekly")
+                    warning = (f"Heads up, boss — you're in the last "
+                               f"ten percent of your {label} usage "
+                               f"window.")
         except Exception:
             pass
+        return warning
 
     async def command(self, cmd: str) -> str:
         """Run a console slash command (/clear, /compact, /model,
@@ -740,7 +762,9 @@ class WarmBrain:
                     spoken = self._result_error_line(msg)
                     if spoken:
                         yield spoken
-                    await self._pull_rate_limits()
+                    usage_warning = await self._pull_rate_limits()
+                    if usage_warning:
+                        yield usage_warning
                     break
             tail = buf.strip()
             if tail:
