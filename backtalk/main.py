@@ -358,6 +358,10 @@ CONSOLE_VERBS = {
     "fast":      ("switch to the fast model", "use the fast model",
                   "back to the fast model", "slash model fast"),
     "usage":     ("usage report", "slash usage"),
+    "status":    ("any update", "any updates", "status check",
+                  "are you there", "you still there",
+                  "how's it going", "hows it going",
+                  "what's happening", "whats happening"),
     "micopen":   ("go hands free", "hands free mode",
                   "hands free listening", "open mic", "open the mic"),
     "micptt":    ("push to talk", "push to talk mode",
@@ -447,6 +451,35 @@ def _spoken_usage(sess, ctx_usage):
     except Exception:
         pass
     return ". ".join(parts) + "."
+
+
+def _fmt_elapsed(seconds):
+    secs = round(seconds)
+    if secs < 60:
+        return f"{secs} second{'s' if secs != 1 else ''}"
+    mins = round(secs / 60)
+    return f"{mins} minute{'s' if mins != 1 else ''}"
+
+
+def _spoken_status(snap):
+    """Answer "any update?" from the task snapshot alone — no model
+    call, so this must read right whether something's running, just
+    finished, or nothing's happened at all this session."""
+    background, tasks = snap["background"], snap["tasks"]
+    if background:
+        lead = background[0]
+        more = f", plus {len(background) - 1} more" if len(background) > 1 else ""
+        return (f"Still running — {lead['label']}, going on "
+                f"{_fmt_elapsed(lead['elapsed'])}{more}.")
+    if tasks:
+        lead = tasks[0]
+        more = f", plus {len(tasks) - 1} more" if len(tasks) > 1 else ""
+        return f"Working on it — {lead['label']}{more}."
+    last_done = snap["last_done"]
+    if last_done:
+        return (f"All done. Last thing I finished was {last_done['label']}, "
+                f"about {_fmt_elapsed(last_done['elapsed'])} ago.")
+    return "Nothing running right now."
 
 _PASTE_ON = "\x1b[200~"    # bracketed-paste markers (we enable the mode below)
 _PASTE_OFF = "\x1b[201~"
@@ -900,6 +933,9 @@ async def amain():
             resp = ""
             mouth.say(_spoken_usage(brain.session,
                                     await brain.context_usage()))
+        elif verb == "status":
+            resp = ""
+            mouth.say(_spoken_status(signals.status_snapshot()))
         elif verb == "micopen":
             resp = ""
             if _MIC["mode"] == "open":

@@ -266,6 +266,25 @@ def end_subagent_task(agent_id: str):
     _write_tasks()
 
 
+def status_snapshot() -> dict:
+    """What's running right now, read straight from the in-memory task
+    dicts — no new state, no file read. For a Tier 0 "any update?"
+    voice-console shortcut to answer without ever touching the model.
+    Never raises."""
+    now = time.time()
+    with _subagent_lock:
+        background = [{"label": e["label"], "elapsed": now - e["ts"]}
+                      for e in _subagent_tasks.values()]
+    tasks = [{"label": e["label"], "elapsed": now - e["ts"]}
+             for e in _tasks.values()]
+    last_done = None
+    if _last_done is not None:
+        last_done = {"label": _last_done["label"],
+                     "elapsed": now - _last_done["completed_ts"]}
+    return {"background": background, "tasks": tasks,
+            "last_done": last_done}
+
+
 # The reply being spoken right now, for the floating reply panel. One
 # dict, replaced turn by turn — never a transcript. `turn` lets a face
 # tell "same reply, more words" from "a new reply started" without
