@@ -15,7 +15,8 @@ from backtalk import signals
 # replace them, so a test that wants to exercise the real write path
 # against a temp file can put the original back for itself.
 REAL_WRITERS = {"last_reply": signals._write_last_reply,
-                "alert": signals._write_alert}
+                "alert": signals._write_alert,
+                "session_info": signals._write_session_info}
 
 
 @pytest.fixture
@@ -31,6 +32,9 @@ def isolate_signal_files(monkeypatch):
     # .voice_alert is read by a live face the moment it exists; a test
     # must never raise a real alert on Hugo's actual screen.
     monkeypatch.setattr(signals, "_write_alert", lambda on: None)
+    # .voice_session is read by a live face's pill the same way -- a
+    # test must never overwrite Hugo's real current model/effort.
+    monkeypatch.setattr(signals, "_write_session_info", lambda m, e: None)
 
 
 @pytest.fixture(autouse=True)

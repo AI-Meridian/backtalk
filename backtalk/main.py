@@ -63,7 +63,7 @@ import sys
 import threading
 import time
 
-from backtalk import auth, signals
+from backtalk import auth, inbox, jev, signals
 from backtalk.brain import WarmBrain
 from backtalk.config import CFG
 from backtalk.ears import (Ears, explain_audio_failure, record_held,
@@ -106,6 +106,65 @@ _AUTOAPPROVE = {"on": False}
 # open-mic capture from before the switch gets discarded, never
 # processed.
 _MIC = {"mode": "ptt", "gen": 0, "btn": False}
+# The live model TIER + effort, published to .voice_session so a
+# face's pill can show the truth. "fast" is the only safe boot guess
+# before the real effort config is read in amain() — _publish_session_info
+# gets called there once config is known, correcting it immediately.
+_SESSION_STATE = {"model_tier": "fast", "effort": ""}
+
+
+def _publish_session_info():
+    signals.set_session_info(_SESSION_STATE["model_tier"],
+                              _SESSION_STATE["effort"])
+
+
+async def handle_inbox_command(cmd: dict, brain: WarmBrain, handle_fn) -> bool:
+    """Dispatch one inbox command (see inbox.py for the shapes).
+    Module-level and taking brain/handle_fn explicitly, rather than a
+    closure inside amain(), so it's directly testable with fakes.
+
+    "message" rides the EXACT SAME handle_fn a typed or spoken
+    utterance uses — quit phrases, console-verb matching, and pending-
+    permission hijacking all still apply, and its own return value
+    (False on quit) propagates out so a UI-sent "goodbye" hangs up the
+    session exactly like saying it would. "model"/"effort" call
+    brain.command the same way the voice console verbs already do.
+    Unknown types/values are logged and ignored, never raised — one
+    bad command file must never take the whole voice session down."""
+    try:
+        typ = cmd.get("type")
+        if typ == "message":
+            text = str(cmd.get("text") or "").strip()
+            if not text:
+                return True
+            return await handle_fn(text)
+        if typ == "model":
+            tier = cmd.get("value")
+            key = inbox.MODEL_TIERS.get(tier)
+            if not key:
+                log(f"[inbox] unknown model tier {tier!r}, ignored")
+                return True
+            await brain.reset_turn()
+            await brain.command(f"/model {CFG[key]}")
+            _SESSION_STATE["model_tier"] = tier
+            _publish_session_info()
+            return True
+        if typ == "effort":
+            lvl = cmd.get("value")
+            if lvl not in inbox.EFFORTS:
+                log(f"[inbox] unknown effort {lvl!r}, ignored")
+                return True
+            await brain.reset_turn()
+            await brain.command(f"/effort {lvl}")
+            _write_config_key("effort", lvl)
+            _SESSION_STATE["effort"] = lvl
+            _publish_session_info()
+            return True
+        log(f"[inbox] unknown command type {typ!r}, ignored")
+        return True
+    except Exception as e:
+        log(f"[inbox] command failed: {e}")
+        return True
 
 # Approvals are EXACT matches after normalization, never prefixes:
 # "yesterday", "yes or no", and "yes, but do not overwrite" must all
@@ -385,7 +444,7 @@ CONSOLE_VERBS = {
     "ask":       ("start asking again", "ask before acting",
                   "ask for permission again"),
 }
-_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+_EFFORTS = inbox.EFFORTS   # single source of truth now lives in inbox.py
 
 
 def console_match(text):
@@ -959,13 +1018,24 @@ async def amain():
     if boot_effort in _EFFORTS:
         await brain.command(f"/effort {boot_effort}")
         log(f"[backtalk] effort set to {boot_effort} (from config)")
+        _SESSION_STATE["effort"] = boot_effort
     elif boot_effort:
         log(f"[backtalk] ignoring unknown effort {boot_effort!r} in config")
+    _publish_session_info()   # correct from the first /state poll onward
 
     speak_task: asyncio.Task | None = None
     typed_q: "queue.Queue[str]" = queue.Queue()
     threading.Thread(target=_typed_reader, args=(typed_q,), daemon=True).start()
     typed_fut: asyncio.Future | None = None
+
+    # THE UI INBOX: the one inbound channel from outside this process —
+    # a face's model/effort dropdown or chat box, via ai-visualizer's
+    # /control and /message endpoints writing a command file. See
+    # inbox.py for the full contract.
+    inbox_q: "queue.Queue[dict]" = queue.Queue()
+    inbox.start_watcher(inbox_q)
+    inbox.start_upload_sweeper()
+    inbox_fut: asyncio.Future | None = None
 
     async def run_console(verb):
         """One voice-console verb. The current reply was already
@@ -995,14 +1065,20 @@ async def amain():
                       "get slower. Say back to the fast model when "
                       "you're done.")
             resp = await brain.command(f"/model {CFG['deep_model']}")
+            _SESSION_STATE["model_tier"] = "deep"
+            _publish_session_info()
             say_after = "Deep model online, for this session only."
         elif verb == "fast":
             resp = await brain.command(f"/model {CFG['model']}")
+            _SESSION_STATE["model_tier"] = "fast"
+            _publish_session_info()
             say_after = "Back on the fast model."
         elif verb.startswith("effort:"):
             lvl = verb.split(":", 1)[1]
             resp = await brain.command(f"/effort {lvl}")
             saved = _write_config_key("effort", lvl)
+            _SESSION_STATE["effort"] = lvl
+            _publish_session_info()
             say_after = (f"Effort set to {lvl}, and saved as your "
                          "default." if saved else
                          f"Effort set to {lvl} for this session. The "
@@ -1173,6 +1249,8 @@ async def amain():
             speak_task = None
         # whatever gets said next is a NEW reply on the face's panel
         signals.reply_new()
+        if CFG.get("jev_shadow"):
+            asyncio.create_task(jev.classify_shadow(text))
         verb = verb or console_match(text)
         if verb:
             await run_console(verb)
@@ -1232,6 +1310,8 @@ async def amain():
                     mic_fut.result(); mic_fut = None
             if typed_fut is None:
                 typed_fut = loop.run_in_executor(None, typed_q.get)
+            if inbox_fut is None:
+                inbox_fut = loop.run_in_executor(None, inbox_q.get)
             if press_fut is None:
                 press_fut = loop.run_in_executor(None, ptt.wait_press)
             # Armed unconditionally, even while speak_task is busy: the
@@ -1247,7 +1327,7 @@ async def amain():
             if unsolicited_fut is None:
                 unsolicited_fut = asyncio.ensure_future(
                     _wait_unsolicited(brain))
-            waiters = {press_fut, typed_fut}
+            waiters = {press_fut, typed_fut, inbox_fut}
             if unsolicited_fut is not None:
                 waiters.add(unsolicited_fut)
             if _MIC["mode"] == "open":
@@ -1263,6 +1343,11 @@ async def amain():
             if typed_fut in done:
                 text = typed_fut.result(); typed_fut = None
                 if text and not await handle(text):
+                    return
+                continue
+            if inbox_fut in done:
+                cmd = inbox_fut.result(); inbox_fut = None
+                if not await handle_inbox_command(cmd, brain, handle):
                     return
                 continue
             if unsolicited_fut is not None and unsolicited_fut in done:

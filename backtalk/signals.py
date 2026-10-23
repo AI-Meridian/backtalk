@@ -54,6 +54,20 @@ is the whole integration surface:
                       line when Claude Code turns out to be signed out
                       (faces go amber/red), cleared once a turn succeeds
                       again. Nothing else here writes it.
+  .voice_session      JSON {model, effort, ts} — the live model TIER
+                      ("fast"/"deep"/"fable") and effort level, written
+                      on boot and on every switch (voice console verb
+                      OR a face's model/effort dropdown), so a face's
+                      pill can show the truth instead of guessing.
+  .voice_inbox/       DIRECTORY, INBOUND — the one part of this bus
+                      that is NOT backtalk talking to a face. A face
+                      (or anything else) drops one *.json command file
+                      here; backtalk's inbox.py claims and deletes each
+                      one. See inbox.py for the command shapes.
+  .voice_uploads/     DIRECTORY, INBOUND-ADJACENT — where a face's
+                      drag-and-drop/file-picker uploads land, written
+                      by ai-visualizer's server, read by Claude's own
+                      Read tool via brain.py's add_dirs wiring.
 
 Written to signals_dir (default: the repo root). Visualizers built on
 this contract just work.
@@ -88,6 +102,7 @@ _TASK_FILE = os.path.join(_DIR, ".voice_task")
 _LAST_DONE_FILE = os.path.join(_DIR, ".voice_task_completed")
 _LAST_REPLY_FILE = os.path.join(_DIR, ".voice_last_reply")
 _ALERT_FILE = os.path.join(_DIR, ".voice_alert")
+_SESSION_FILE = os.path.join(_DIR, ".voice_session")
 
 _BH = CFG.get("barehands_state_dir") or ""
 _BH_STATE = os.path.join(_BH, "state") if _BH else ""
@@ -266,6 +281,17 @@ def end_subagent_task(agent_id: str):
     _write_tasks()
 
 
+def has_active_subagents() -> bool:
+    """True while one or more background Agent/Task tool calls are
+    still running, regardless of how many. brain.reset_turn() checks
+    this to decide how long an interrupted turn is allowed to take
+    realigning: real background work in flight needs real patience,
+    not the few-hundred-ms budget that covers a handful of buffered
+    leftovers. Never raises."""
+    with _subagent_lock:
+        return bool(_subagent_tasks)
+
+
 def status_snapshot() -> dict:
     """What's running right now, read straight from the in-memory task
     dicts — no new state, no file read. For a Tier 0 "any update?"
@@ -338,6 +364,24 @@ def set_alert(on: bool):
     signed out" — a fault the face must show even when the voice line
     has nothing to say. Never raises."""
     _write_alert(bool(on))
+
+
+def _write_session_info(model_tier: str, effort: str):
+    try:
+        with open(_SESSION_FILE, "w") as f:
+            json.dump({"model": model_tier, "effort": effort,
+                       "ts": time.time()}, f)
+    except OSError:
+        pass
+
+
+def set_session_info(model_tier: str, effort: str):
+    """The live model TIER ("fast"/"deep"/"fable") and effort level,
+    for a face's pill to render instead of guessing. Called after boot
+    and after every switch, whichever path triggered it (voice console
+    verb or a UI inbox command) — see main.py's _publish_session_info.
+    Never raises."""
+    _write_session_info(model_tier, effort)
 
 
 def feed_waveform(pcm: np.ndarray):

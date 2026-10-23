@@ -54,6 +54,16 @@ DEFAULTS = {
     # lasts one session and is always spoken; this default never moves
     # by itself.
     "deep_model": "claude-opus-5",
+    # The third model tier, picked from a face's model dropdown
+    # (Sonnet/Opus/Fable). Never reachable by voice console phrase —
+    # that's deliberately unchanged ("deep"/"fast" only) — only via the
+    # UI inbox command described in inbox.py. Full id ON PURPOSE, same
+    # reasoning as "model" above.
+    "fable_model": "claude-fable-5",
+    # The fourth model tier, picked from a face's model dropdown
+    # (Sonnet/Opus/Fable/Haiku). Same deal as fable_model: UI-only, never
+    # a voice console phrase, full id ON PURPOSE.
+    "haiku_model": "claude-haiku-4-5-20251001",
     # Tool permissions for the voice session. "ask" is the default ON
     # PURPOSE (safety is opt-out, never opt-in): when the agent wants a
     # gated tool (write a file, run a real command), it ASKS OUT LOUD
@@ -232,10 +242,30 @@ DEFAULTS = {
                    "acompressor=threshold=-18dB:ratio=2.5:attack=8:"
                    "release=120:makeup=4dB,alimiter=limit=0.95"),
     },
+    # SHADOW MODE ONLY, default off on purpose: every utterance also
+    # gets sent to Jev (TypeSafe), a third-party classifier, which logs
+    # a tier guess (see jev.py) but never changes what the agent
+    # actually does. Exists to collect real accuracy data before ever
+    # trusting it to skip the model for real. Turning this on means a
+    # second cloud vendor now sees every utterance, not just Claude —
+    # a deliberate per-install decision, never default-true. Needs an
+    # API key in the macOS Keychain under backtalk-typesafe (see
+    # jev._get_key for the seeding one-liner).
+    "jev_shadow": False,
     # Where the signal-bus files are written (.voice_state,
     # .voice_waveform, .voice_loading_pid) — anything can watch them;
     # visualizers pair with this contract. Default: the repo root.
     "signals_dir": "",
+    # Where a face's drag-and-drop/file-picker uploads land, so a
+    # dropped file or image reaches Claude the same way a terminal
+    # paste does: the absolute path just becomes part of the message
+    # text, and Claude's own Read tool opens it. "" resolves to
+    # <signals_dir>/.voice_uploads in load() below. Always folded into
+    # add_dirs (see brain.py) so the session can reach it regardless of
+    # extra_dirs. Created with 0700 permissions — this is the one
+    # directory an external process (ai-visualizer's server) writes
+    # INTO, not just reads from.
+    "uploads_dir": "",
     # THE BAREHANDS SEAM: point this at a barehands checkout's state/
     # folder and its on-screen ring becomes your agent's face — it
     # breathes while idle, spins while thinking, pulses with the voice.
@@ -314,6 +344,17 @@ def load() -> dict:
     cfg["extra_dirs"] = [_expand(d) for d in cfg.get("extra_dirs", [])]
     cfg["blocked_paths"] = [_expand(d) for d in cfg.get("blocked_paths", [])]
     cfg["signals_dir"] = _expand(cfg.get("signals_dir", "")) or str(REPO)
+    cfg["uploads_dir"] = (_expand(cfg.get("uploads_dir", ""))
+                          or str(Path(cfg["signals_dir"]) / ".voice_uploads"))
+    # Created HERE, not by inbox.py's watcher: that starts well after
+    # WarmBrain.start() has already passed this path to the SDK's
+    # add_dirs, which needs the directory to actually exist at connect
+    # time. CFG = load() runs at import time, before anything else in
+    # main.py, so this is the earliest possible point.
+    try:
+        os.makedirs(cfg["uploads_dir"], exist_ok=True, mode=0o700)
+    except OSError:
+        pass
     cfg["barehands_state_dir"] = _expand(cfg.get("barehands_state_dir", ""))
     thinking = _expand(cfg.get("thinking_sound", ""))
     if thinking and not os.path.isabs(thinking):

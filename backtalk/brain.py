@@ -224,6 +224,26 @@ _ASK_IDLE_TIMEOUT = 240
 # image/doc read) can trip that default. 10x headroom.
 _MAX_BUFFER_SIZE = 10 * 1024 * 1024
 
+# reset_turn's drain patience when a background Agent/Task call is
+# still genuinely running at GENUINE-INTERRUPT time (the user actually
+# talked over a live reply) — see the UNSOLICITED-REPLY comment in
+# __init__ for why the SDK withholds a turn's ResultMessage until every
+# such call finishes. The default `timeout` (8s) is right for draining
+# a few buffered leftovers, but too short to find a turn that's
+# legitimately still waiting on real background work. A bounded
+# single-shot grace period, not an open-ended re-poll: an earlier
+# version of this fix kept re-checking has_active_subagents() and
+# raising the wait every time it came back true, capped at 4 hours —
+# which meant a genuine interrupt during a long-running agent could
+# hold _inbox_lock (and therefore every future ask_stream) hostage for
+# up to that long. This bounded version gives up after ONE grace
+# window and rebuilds instead, same as the no-subagent path just with
+# more patience. The common case — nothing was actually interrupted,
+# the turn simply hasn't gotten its ResultMessage back yet because a
+# background agent is still running — never reaches this at all: see
+# `_background_pending` in __init__, which reset_turn checks first.
+_DESYNC_GRACE_WITH_ACTIVE_SUBAGENTS = 30.0
+
 
 SESSION_FILE = os.path.join(CFG["signals_dir"], ".backtalk_session")
 
@@ -287,6 +307,24 @@ class WarmBrain:
         self.last_error: str | None = None
         self.auth_failed = False
         self._alert_raised = False
+        # THE BACKGROUND-AGENT FREEZE FIX. True once _pump_sentences has
+        # seen the model finish TALKING (message_stop) for a turn that
+        # dispatched a still-running background agent — i.e. _dirty is
+        # True only because the SDK is withholding this turn's
+        # ResultMessage for the agent, not because anything is desynced.
+        # reset_turn() checks this to skip its interrupt+drain dance
+        # entirely in that case: there's nothing to interrupt (the reply
+        # already finished speaking) and nothing to drain (the stream
+        # was never desynced), so there's no reason to block the NEXT
+        # utterance behind a job that might run for hours. Without this,
+        # every single utterance after a background dispatch called
+        # reset_turn() while still _dirty, which held _inbox_lock (and
+        # therefore every future ask_stream) hostage for as long as the
+        # subagent kept running — unbounded in an earlier version of
+        # this fix. Reproduced 2026-10-21: three background
+        # agents running, then total voice-line silence on the next
+        # utterance for the rest of the session.
+        self._background_pending = False
         # One spoken heads-up per window, not a nag every turn: keyed by
         # the window's own resets_at so a new window (a different
         # resets_at) clears the warning and can fire again next time
@@ -320,7 +358,12 @@ class WarmBrain:
                 include_partial_messages=True,
                 permission_mode=sdk_mode,
                 can_use_tool=self._can_use_tool,
-                add_dirs=CFG["extra_dirs"],
+                # uploads_dir folded in unconditionally: a file dropped
+                # into a face's chat box must be reachable by this
+                # session's Read tool regardless of what extra_dirs the
+                # person has configured.
+                add_dirs=[d for d in (CFG["extra_dirs"]
+                                       + [CFG["uploads_dir"]]) if d],
                 skills=CFG["visible_skills"],
                 resume=rid,
                 max_buffer_size=_MAX_BUFFER_SIZE,
@@ -542,6 +585,17 @@ class WarmBrain:
         the last turn was consumed clean."""
         if not self._client or not self._dirty:
             return
+        if self._background_pending and signals.has_active_subagents():
+            # The previous turn already finished SPEAKING (message_stop
+            # fired in _pump_sentences); it's only still "dirty" because a
+            # background agent it dispatched hasn't reported its
+            # ResultMessage yet. Nothing was interrupted, so there's
+            # nothing here to resync — forcing the interrupt+drain dance
+            # below would block THIS new utterance on _inbox_lock for as
+            # long as that agent keeps running. The eventual ResultMessage/follow-up
+            # still gets caught correctly by next_unsolicited() once
+            # nothing else holds the lock.
+            return
         await self._inbox_lock.acquire()
         try:
             try:
@@ -558,8 +612,11 @@ class WarmBrain:
                         break
                 return n
 
+            drain_task = asyncio.ensure_future(_drain())
             try:
-                drained = await asyncio.wait_for(_drain(), timeout)
+                step = (_DESYNC_GRACE_WITH_ACTIVE_SUBAGENTS
+                         if signals.has_active_subagents() else timeout)
+                drained = await asyncio.wait_for(drain_task, step)
                 if drained == 0:
                     # A genuinely resynced pipe always yields at least the
                     # dead turn's leftover ResultMessage (per the docstring
@@ -577,6 +634,7 @@ class WarmBrain:
                 # desynced. Loses this voice session's conversation memory;
                 # better than answering every question one turn late for the
                 # rest of the day.
+                drain_task.cancel()
                 log("[brain] stream desynced beyond repair — rebuilding the "
                     "session (conversation memory for this session resets)")
                 await self._rebuild_session()
@@ -655,6 +713,7 @@ class WarmBrain:
         pulling/sentence-splitting with next_unsolicited() via
         _pump_sentences()."""
         self._dirty = True             # in flight until its ResultMessage
+        self._background_pending = False   # fresh turn, not waiting on one yet
         await self._inbox_lock.acquire()
         try:
             await self._client.query(utterance)
@@ -681,6 +740,7 @@ class WarmBrain:
         await self._inbox_lock.acquire()
         try:
             self._dirty = True
+            self._background_pending = False
             async for sentence in self._pump_sentences():
                 yield sentence
         finally:
@@ -755,8 +815,28 @@ class WarmBrain:
                         buf = ""
                         if tail:
                             yield tail
+                    elif etype == "message_stop" and signals.has_active_subagents():
+                        # The model is done TALKING — every text block has
+                        # already been flushed above via content_block_stop.
+                        # The only reason this turn's ResultMessage hasn't
+                        # shown up yet is a background Agent/Task call still
+                        # running; that's not a stall and not a desync, it's
+                        # the SDK deliberately holding the pipe open (see
+                        # the UNSOLICITED-REPLY comment in __init__). Stop
+                        # pumping HERE rather than sitting in the next
+                        # `self._inbox.get()` for however long the agent
+                        # takes — that eventual ResultMessage (or a genuine
+                        # surprise follow-up turn) gets caught later by
+                        # next_unsolicited(), exactly the mechanism already
+                        # built for it. Deliberately leaves _dirty True —
+                        # the turn is still genuinely unconsumed — but flags
+                        # _background_pending so reset_turn() knows not to
+                        # treat that as something needing a resync.
+                        self._background_pending = True
+                        break
                 elif t == "ResultMessage":
                     self._dirty = False    # turn fully consumed — pipe aligned
+                    self._background_pending = False
                     self._tally(msg)
                     self._remember_session(msg)
                     spoken = self._result_error_line(msg)
